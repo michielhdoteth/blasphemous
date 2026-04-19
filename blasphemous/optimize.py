@@ -15,7 +15,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from .analyze import AnalysisReport
 from .extract import DirectionManifold, project_weights
-from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 from .ui import info, trial_log, success, metric
 from .lora_ablation import (
     apply_projection_ablation,

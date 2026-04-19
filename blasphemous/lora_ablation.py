@@ -64,41 +64,46 @@ def simple_lora_ablate(
 
         layer = model.model.layers[layer_idx]
 
-        # Apply to attention output projection
+        # TARGET MODULES: Qwen2.5 uses DeltaNet (linear_attn) + standard (self_attn)
+        target_modules = []
+        
+        # Standard attention (self_attn)
         if hasattr(layer.self_attn, "o_proj"):
-            w = layer.self_attn.o_proj.weight.data
+            target_modules.append(layer.self_attn.o_proj)
+        
+        # DeltaNet output - Qwen2.5 specific, often MISSING in other implementations!
+        if hasattr(layer, 'linear_attn') and hasattr(layer.linear_attn, 'out_proj'):
+            target_modules.append(layer.linear_attn.out_proj)
+        
+        # MLP
+        if hasattr(layer.mlp, 'down_proj'):
+            target_modules.append(layer.mlp.down_proj)
+
+        # Apply ablation to ALL target modules
+        for module in target_modules:
+            if module is None:
+                continue
+            w = module.weight.data
             w_float = w.float()
+            
+            # Pre-normalize rows for stable projection
+            row_norms = w_float.norm(dim=1, keepdim=True)
+            w_normalized = w_float / row_norms.clamp(min=1e-8)
 
-            # Rank-1 update: W' = W - weight * (W @ v) @ v^T
-            v = direction[: w_float.shape[1]].float()
-            if v.shape[0] < w_float.shape[1]:
-                # Pad if needed
-                v_padded = torch.zeros(w_float.shape[1], device=w.device, dtype=v.dtype)
-                v_padded[: v.shape[0]] = v
-                v = v_padded
-
-            # Compute projection
-            proj = (w_float @ v).unsqueeze(-1) * v.unsqueeze(0)
-            w_new = w_float - weight * proj
-
-            layer.self_attn.o_proj.weight.data = w_new.to(w.dtype)
-            n_modified += 1
-
-        # Apply to MLP down projection
-        if hasattr(layer.mlp, "down_proj"):
-            w = layer.mlp.down_proj.weight.data
-            w_float = w.float()
-
-            v = direction[: w_float.shape[1]].float()
+            v = direction[:w_float.shape[1]].float()
             if v.shape[0] < w_float.shape[1]:
                 v_padded = torch.zeros(w_float.shape[1], device=w.device, dtype=v.dtype)
-                v_padded[: v.shape[0]] = v
+                v_padded[:v.shape[0]] = v
                 v = v_padded
 
-            proj = (w_float @ v).unsqueeze(-1) * v.unsqueeze(0)
-            w_new = w_float - weight * proj
+            # Projection with normalized weights
+            proj = (w_normalized @ v).unsqueeze(-1) * v.unsqueeze(0)
+            w_new_denorm = w_normalized - weight * proj
+            
+            # Restore original norms
+            w_new = w_new_denorm * row_norms
 
-            layer.mlp.down_proj.weight.data = w_new.to(w.dtype)
+            module.weight.data = w_new.to(w.dtype)
             n_modified += 1
 
     return {

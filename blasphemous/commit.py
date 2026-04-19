@@ -16,7 +16,7 @@ from .optimize import (
     _measure_kl,
     _kernel_weights,
 )
-from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 from .causal import CausalReport
 from .ui import info, metric, success
 

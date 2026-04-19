@@ -119,7 +119,7 @@ class DirectionManifold:
         direction from the current model state, accounting for any
         previous compensations that may have rotated the refusal space.
         """
-        from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+        from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 
         model.eval()
         n_prompts = min(8, len(HARMFUL_PROMPTS))
@@ -457,3 +457,36 @@ def project_weights(
             weight = weight * (original_norm / current_norm)
 
     return weight
+
+
+def select_refusal_layers(report: AnalysisReport, min_silhouette: float = 0.5) -> list[int]:
+    """Select layers with strong refusal signal - skip noisy layers.
+    
+    This is critical for generalization - abliterating layers without real
+    refusal signal adds noise that breaks generalization.
+    
+    Args:
+        report: Analysis report with layer geometry
+        min_silhouette: Minimum silhouette score (default: 0.5)
+        
+    Returns:
+        Layer indices with strong refusal signal
+    """
+    good_layers = []
+    for geom in report.layer_geometry:
+        # Layer has strong refusal separation if:
+        # - High silhouette (clear harmful vs harmless separation)
+        # - Positive cosine (harmful and harmless point different directions)
+        if geom.silhouette >= min_silhouette and geom.cosine_harmful_harmless > 0:
+            good_layers.append(geom.layer_idx)
+    
+    if not good_layers:
+        # Fallback: use top 3 layers by silhouette
+        sorted_layers = sorted(
+            report.layer_geometry, 
+            key=lambda g: g.silhouette, 
+            reverse=True
+        )[:3]
+        good_layers = [g.layer_idx for g in sorted_layers]
+    
+    return good_layers

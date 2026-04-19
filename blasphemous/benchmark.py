@@ -8,7 +8,9 @@ from typing import Iterable
 import torch
 import transformers
 
-from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+# BENCHMARK uses eval prompts ONLY (never training prompts)
+# This prevents prompt overfitting - results must generalize to unseen prompts
+from .train_prompts import HARMLESS_PROMPTS
 from .harmbench_loader import load_harmbench as load_harmbench_prompts
 
 REFUSAL_PHRASES = (
@@ -174,7 +176,12 @@ def benchmark_model(
 ) -> BenchmarkReport:
     model, tokenizer = load_model_and_tokenizer(model_path, device=device, dtype=dtype)
 
-    harmful_prompts = HARMFUL_PROMPTS[:harmful_limit] if harmful_limit else HARMFUL_PROMPTS
+    # EVALUATION: Use HarmBench for harmful prompts (unseen during training)
+    # This is the key fix - prevents prompt overfitting!
+    harmful_prompts = load_harmbench_prompts(
+        split="test",
+        max_prompts=harmful_limit if harmful_limit else 100,
+    )
     harmless_prompts = (
         HARMLESS_PROMPTS[:harmless_limit] if harmless_limit else HARMLESS_PROMPTS
     )

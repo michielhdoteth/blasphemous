@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 
 
 @dataclass
