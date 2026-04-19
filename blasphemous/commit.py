@@ -191,32 +191,39 @@ def multi_pass_ablate(
         if pass_idx < n_passes - 1 and refusal_after > 0.10:
             info(f"  Re-extracting residual direction for next pass...")
             try:
-                # Build new manifold from current model state
-                new_manifold = build_manifold(
-                    model,
-                    tokenizer,
-                    HARMFUL_PROMPTS,
-                    HARMLESS_PROMPTS,
-                    device,
-                )
-                
-                # Get refined direction from new manifold (with higher index for residual)
+                # Use existing manifold but sample different direction (residual = higher index)
+                # This is simpler than rebuilding manifold from scratch
                 new_direction_index = min(
                     params.direction_index + (pass_idx + 1) * 0.5,
-                    new_manifold.n_layers - 1,
+                    manifold.n_layers - 1,
                 )
                 
-                new_direction = new_manifold.sample(
+                # Get direction from different type for variety
+                direction_type = "whitened" if pass_idx % 2 == 0 else "safe"
+                new_direction = manifold.sample(
                     new_direction_index,
-                    direction_type="whitened",
+                    direction_type=direction_type,
                 ).to(device)
                 
-                # Select good layers (skip noisy ones)
-                good_layers = select_refusal_layers(new_manifold, min_silhouette=0.4)
+                # Get layer weights from params
+                layer_weights = _kernel_weights(
+                    n_layers=len(list(model.model.layers)),
+                    peak_pos=params.kernel_peak_pos,
+                    max_weight=params.attn_max_weight * 0.7,  # Lighter for refinement
+                    min_weight=params.kernel_min_weight,
+                    aggressive=False,
+                )
                 
-                # Apply refined direction to good layers only
-                for layer_idx in good_layers[:8]:  # Top 8 layers
+                # Apply to good layers only (using manifold's layer selection)
+                layer_ids = manifold.layer_ids[:8]  # Top 8 layers from original extraction
+                
+                for layer_idx in layer_ids:
                     layer = model.model.layers[layer_idx]
+                    weight = layer_weights[layer_idx] if layer_idx < len(layer_weights) else 0.0
+                    if weight < 0.1:
+                        continue
+                        
+                    # Apply to attention
                     if hasattr(layer.self_attn, "o_proj"):
                         w = layer.self_attn.o_proj.weight.data.float()
                         row_norms = w.norm(dim=1, keepdim=True)
@@ -227,12 +234,12 @@ def multi_pass_ablate(
                             v = torch.zeros(w.shape[1], device=w.device, dtype=v.dtype)
                         
                         proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
-                        w_new = w_norm - 0.5 * proj  # Lighter weight for refinement
+                        w_new = w_norm - weight * proj
                         w_restored = w_new * row_norms
                         
                         layer.self_attn.o_proj.weight.data = w_restored.to(w.dtype)
                 
-                info(f"  Refined {len(good_layers[:8])} layers with residual direction")
+                info(f"  Refined {len(layer_ids)} layers with residual direction")
                 
             except Exception as e:
                 info(f"  Warning: Re-extraction failed ({e}), continuing with current direction")
