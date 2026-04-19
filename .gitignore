@@ -102,6 +102,7 @@ test_output/
 *.log
 runs/
 logs/
+test_liberated_v040/
 
 # Cache
 .cache/
