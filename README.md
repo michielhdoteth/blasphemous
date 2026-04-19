@@ -78,9 +78,9 @@ python run_test.py
 
 ## Related Projects
 
-- [Heretic](https://github.com/p-e-w/heretic) - Fully automatic censorship removal (TPE-based, different approach)
-- [ABLIterator](https://github.com/wassname/abliterator) - Concept removal with baukit
-- [deccp](https://github.com/AUGMXNT/deccp) - Direction erasure
+- [OBLITERATUS](https://github.com/elder-plinius/OBLITERATUS) — Advanced platform with HF Spaces (4.8k stars)
+- [Heretic](https://github.com/p-e-w/heretic) — Fully automatic (19.6k stars)
+- [deccp](https://github.com/AUGMXNT/deccp) — Direction erasure
 
 ## Citation
 
