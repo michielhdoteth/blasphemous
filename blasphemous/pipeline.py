@@ -172,7 +172,7 @@ def _print_banner(model_name: str, device: str, n_trials: int):
 +========================================================+
 |  B L A S P H E M O U S                              |
 |  Analysis-Informed Bayesian Abliteration             |
-|  OBLITERATUS geometry x Heretic optimization         |
+|  Optimal Transport x LoRA Ablation              |
 +========================================================+""")
     print(f"  Model  : {model_name}")
     print(f"  Device : {device}")

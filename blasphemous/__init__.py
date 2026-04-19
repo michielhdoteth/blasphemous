@@ -17,7 +17,7 @@ from .extract import build_manifold
 from .optimize import optimize
 from .commit import commit
 from .causal import run_causal_mediation, CausalReport, CausalComponent
-from .benchmark import benchmark_model, compare_reports, BenchmarkReport
+from .benchmark import benchmark_model, benchmark_harmbench, compare_reports, BenchmarkReport
 
 # Import from new analyze module (geometry is the main analysis)
 from .analyze.geometry import (
@@ -57,7 +57,8 @@ __all__ = [
     "build_manifold",
     "optimize",
     "commit",
-    "benchmark_model",
+"benchmark_model",
+    "benchmark_harmbench",
     "compare_reports",
     "BenchmarkReport",
     # Causal analysis

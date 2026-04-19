@@ -9,6 +9,7 @@ import torch
 import transformers
 
 from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+from .harmbench_loader import load_harmbench as load_harmbench_prompts
 
 REFUSAL_PHRASES = (
     "i'm sorry",
@@ -238,3 +239,89 @@ def compare_reports(
         - baseline.harmless_refusal_rate,
         "balanced_score_delta": candidate.balanced_score - baseline.balanced_score,
     }
+
+
+def benchmark_harmbench(
+    model_path: str,
+    output_path: str | None = None,
+    device: str = "auto",
+    dtype: torch.dtype = torch.float16,
+    max_prompts: int = 100,
+    max_new_tokens: int = 128,
+    category: str | None = None,
+) -> BenchmarkReport:
+    """Benchmark on HarmBench dataset - proper held-out evaluation.
+    
+    This uses prompts NOT seen during training for proper evaluation.
+    
+    Args:
+        model_path: Path to model
+        output_path: Where to save report
+        device: cuda/cpu
+        dtype: Model dtype
+        max_prompts: Max HarmBench prompts to test
+        max_new_tokens: Generation length
+        category: Optional category filter
+        
+    Returns:
+        BenchmarkReport with HarmBench evaluation
+    """
+    model, tokenizer = load_model_and_tokenizer(model_path, device=device, dtype=dtype)
+    
+    # Load HarmBench prompts - these are NOT in training set
+    harmbench_prompts = load_harmbench_prompts(
+        split="test",
+        category=category,
+        max_prompts=max_prompts,
+    )
+    
+    # Use same harmless prompts (they don't affect training)
+    harmless_prompts = HARMLESS_PROMPTS[:50]  # Use subset
+    
+    # Evaluate on HarmBench (held-out)
+    harmbench_samples = _evaluate_prompts(
+        model, tokenizer, harmbench_prompts, "harmbench", max_new_tokens=max_new_tokens
+    )
+    
+    # Evaluate on harmless
+    harmless_samples = _evaluate_prompts(
+        model, tokenizer, harmless_prompts, "harmless", max_new_tokens=max_new_tokens
+    )
+    
+    harmbench_refusal_rate = sum(item.is_refusal for item in harmbench_samples) / max(
+        len(harmbench_samples), 1
+    )
+    harmless_refusal_rate = sum(item.is_refusal for item in harmless_samples) / max(
+        len(harmless_samples), 1
+    )
+    
+    metadata = load_saved_metadata(model_path)
+    final_metrics = metadata.get("final_metrics", {})
+    kl_guardrail = final_metrics.get("kl_divergence")
+    balanced_score = compute_balanced_score(
+        harmbench_refusal_rate,
+        harmless_refusal_rate,
+        kl_guardrail=kl_guardrail,
+    )
+    
+    report = BenchmarkReport(
+        model_path=model_path,
+        harmful_refusal_rate=harmbench_refusal_rate,
+        harmless_refusal_rate=harmless_refusal_rate,
+        balanced_score=balanced_score,
+        kl_guardrail=kl_guardrail,
+        method=metadata.get("optimization", {}).get("method"),
+        params=metadata.get("optimization", {}),
+        output_path=output_path,
+        harmful_samples=harmbench_samples,
+        harmless_samples=harmless_samples,
+    )
+    
+    if output_path is not None:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(
+            json.dumps(report.to_json(), indent=2, default=str),
+            encoding="utf-8",
+        )
+    
+    return report
