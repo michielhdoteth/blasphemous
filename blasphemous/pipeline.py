@@ -71,7 +71,7 @@ def run(
     info(f"Quantization: {quantization}")
 
     load_kwargs = dict(
-        torch_dtype=dtype,
+        dtype=dtype,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     )

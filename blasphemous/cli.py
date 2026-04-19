@@ -54,12 +54,12 @@ Examples:
     parser.add_argument(
         "--quantization", default=None, choices=["bnb_4bit"], help="Quantization mode"
     )
-    parser.add_argument(
-"--method",
+parser.add_argument(
+        "--method",
         "-m",
-        default="projection",
+        default="auto",
         choices=["projection", "lora", "optimal_transport", "auto"],
-        help="Core method: projection (default), lora, optimal_transport fallback, or auto.",
+        help="Core method: auto (uses analysis to choose), projection, lora, or optimal_transport.",
     )
     parser.add_argument(
         "--aggressive",
@@ -256,7 +256,7 @@ def _run_analyze_only(args, dtype_map):
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=dtype_map[args.dtype],
+        dtype=dtype_map[args.dtype],
         device_map=device,
         trust_remote_code=True,
     )

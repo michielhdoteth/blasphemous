@@ -70,7 +70,7 @@ def load_model_and_tokenizer(
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map=resolved_device,
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(
