@@ -9,6 +9,9 @@ import torch.nn.functional as F
 
 from .analyze import AnalysisReport
 from .extract import DirectionManifold, project_weights
+from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+from .causal import CausalReport
+from .ui import info, metric, success
 from .optimize import (
     OptimizationResult,
     _apply_ablation,
@@ -16,9 +19,7 @@ from .optimize import (
     _measure_kl,
     _kernel_weights,
 )
-from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
-from .causal import CausalReport
-from .ui import info, metric, success
+from .extract import build_manifold  # Add for re-extraction
 
 
 @dataclass
@@ -119,6 +120,128 @@ def _measure_ouroboros_signal(
     )
 
     return float(ouroboros_signal)
+
+
+def multi_pass_ablate(
+    model,
+    tokenizer,
+    original_model,
+    manifold: DirectionManifold,
+    report: AnalysisReport,
+    params,
+    device: str = "cuda",
+    n_passes: int = 3,
+) -> dict:
+    """Apply multi-pass ablation with iterative direction refinement.
+    
+    This is the KEY addition that OBLITERATUS/Heretic use:
+    - Pass 1: Apply initial ablation
+    - Pass 2: Re-extract residual direction, apply again  
+    - Pass 3: Final refinement
+    
+    Each pass targets the REMAINING refusal that survived previous passes.
+    
+    Args:
+        model: The model to ablate (modified in place)
+        tokenizer: Tokenizer
+        original_model: Clean copy for KL comparison
+        manifold: Direction manifold from initial extraction
+        report: Analysis report
+        params: Search parameters from optimization
+        device: cuda/cpu
+        n_passes: Number of ablation passes (default 3)
+        
+    Returns:
+        Dict with pass results and final metrics
+    """
+    from .extract import build_manifold, select_refusal_layers
+    
+    info(f"Starting multi-pass ablation ({n_passes} passes)...")
+    
+    pass_results = []
+    current_refusal = 1.0
+    
+    for pass_idx in range(n_passes):
+        info(f"Ablation pass {pass_idx + 1}/{n_passes}...")
+        
+        # Apply ablation with current parameters
+        if getattr(params, "method", "projection") == "projection":
+            _apply_ablation(model, manifold, params, device)
+        else:
+            _apply_ablation(model, manifold, params, device)
+        
+        # Measure refusal after this pass
+        refusal_after = _measure_refusal_rate(model, tokenizer, device, n_prompts=20)
+        kl_after = _measure_kl(model, original_model, tokenizer, device, n_prompts=20)
+        
+        info(f"  Pass {pass_idx + 1}: refusal={refusal_after:.3f}, KL={kl_after:.6f}")
+        
+        pass_results.append({
+            "pass": pass_idx + 1,
+            "refusal": refusal_after,
+            "kl": kl_after,
+        })
+        
+        # Check if we've reached acceptable level
+        if refusal_after < 0.15:
+            info(f"  Reached acceptable refusal: {refusal_after:.3f}")
+            break
+        
+        # If more passes remaining, re-extract direction from residual refusal
+        if pass_idx < n_passes - 1 and refusal_after > 0.10:
+            info(f"  Re-extracting residual direction for next pass...")
+            try:
+                # Build new manifold from current model state
+                new_manifold = build_manifold(
+                    model,
+                    tokenizer,
+                    HARMFUL_PROMPTS,
+                    HARMLESS_PROMPTS,
+                    device,
+                )
+                
+                # Get refined direction from new manifold (with higher index for residual)
+                new_direction_index = min(
+                    params.direction_index + (pass_idx + 1) * 0.5,
+                    new_manifold.n_layers - 1,
+                )
+                
+                new_direction = new_manifold.sample(
+                    new_direction_index,
+                    direction_type="whitened",
+                ).to(device)
+                
+                # Select good layers (skip noisy ones)
+                good_layers = select_refusal_layers(new_manifold, min_silhouette=0.4)
+                
+                # Apply refined direction to good layers only
+                for layer_idx in good_layers[:8]:  # Top 8 layers
+                    layer = model.model.layers[layer_idx]
+                    if hasattr(layer.self_attn, "o_proj"):
+                        w = layer.self_attn.o_proj.weight.data.float()
+                        row_norms = w.norm(dim=1, keepdim=True)
+                        w_norm = w / row_norms.clamp(min=1e-8)
+                        
+                        v = new_direction[:w.shape[1]].float()
+                        if v.shape[0] < w.shape[1]:
+                            v = torch.zeros(w.shape[1], device=w.device, dtype=v.dtype)
+                        
+                        proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
+                        w_new = w_norm - 0.5 * proj  # Lighter weight for refinement
+                        w_restored = w_new * row_norms
+                        
+                        layer.self_attn.o_proj.weight.data = w_restored.to(w.dtype)
+                
+                info(f"  Refined {len(good_layers[:8])} layers with residual direction")
+                
+            except Exception as e:
+                info(f"  Warning: Re-extraction failed ({e}), continuing with current direction")
+    
+    return {
+        "n_passes": len(pass_results),
+        "passes": pass_results,
+        "final_refusal": pass_results[-1]["refusal"] if pass_results else 1.0,
+    }
 
 
 def _apply_focused_compensation(
@@ -339,20 +462,28 @@ def commit(
 
         info("Running causal mediation analysis...")
         causal_report = run_causal_mediation(
-            model, tokenizer, device, n_pairs=causal_pairs, top_k=causal_top_k
+model, tokenizer, device, n_pairs=causal_pairs, top_k=causal_top_k
         )
 
-    for pass_idx in range(params.n_refinement_passes):
-        info(f"Commit pass {pass_idx + 1}/{params.n_refinement_passes}...")
-        if getattr(params, "method", "projection") == "projection":
-            _apply_ablation_with_causal(model, manifold, params, device, causal_report)
-        else:
-            _apply_ablation(model, manifold, params, device)
+    # Use MULTI-PASS ablation (like OBLITERATUS) - key for generalization!
+    # This applies iterative refinement - each pass targets remaining refusal
+    multi_pass_result = multi_pass_ablate(
+        model,
+        tokenizer,
+        original_model,
+        manifold,
+        report,
+        params,
+        device,
+        n_passes=3,  # OBLITERATUS uses 2-3 passes
+    )
 
+    # Get final metrics
     refusal = _measure_refusal_rate(model, tokenizer, device, n_prompts=30)
     kl = _measure_kl(model, original_model, tokenizer, device, n_prompts=30)
     metric("Post-commit refusal", f"{refusal:.3f}")
     metric("Post-commit KL", f"{kl:.6f}")
+    metric("Multi-pass result", f"{multi_pass_result.get('n_passes', 0)} passes")
 
     ouroboros_compensated = False
     n_comp_passes = 0
