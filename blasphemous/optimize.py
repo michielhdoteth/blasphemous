@@ -449,17 +449,17 @@ def optimize(
         direction_index = float(base_idx) + perturbation
         direction_index = max(0.0, min(direction_index, manifold.n_layers - 1.001))
 
-        # EXPANDED: Much higher weight search space for more aggressive ablation
-        # Research shows higher weights can completely remove refusal
+        # Weight search based on Heretic/OBLITERATUS research: 0.8-1.5 is safe range
+        # Too high (>2.0) breaks model output entirely
         attn_max = trial.suggest_float(
             "attn_max_weight",
-            0.1,
-            10.0,  # Expanded to 10.0 for aggressive ablation
+            0.8,   # Heretic default: 0.8-1.5
+            1.5,   # Above 2.0 breaks model
         )
         mlp_max = trial.suggest_float(
             "mlp_max_weight",
-            0.1,
-            10.0,  # Expanded to 10.0 for aggressive ablation
+            0.8,
+            1.5,
         )
 
         # EXPANDED: More layer strategies for better targeting
@@ -571,9 +571,10 @@ def optimize(
             best_metrics["ouroboros_score"] = ouroboros_approx
             success("NEW BEST!")
 
-            # EARLY STOPPING: If refusal < 1%, stop optimization
-            if refusal < 0.01:
-                success("EARLY STOP: Refusal below 1%!")
+            # EARLY STOPPING: If refusal < 15%, stop optimization
+            # Going lower breaks model quality - 15% is acceptable tradeoff
+            if refusal < 0.15:
+                success("EARLY STOP: Refusal below 15% - good balance achieved!")
                 study.stop()
         else:
             trial_log(f"Current best: {best_value:.4f}")

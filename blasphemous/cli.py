@@ -36,8 +36,8 @@ Examples:
     parser.add_argument(
         "--lambda-kl",
         type=float,
-        default=0.5,
-        help="KL divergence penalty weight (default: 0.5)",
+        default=1.5,
+        help="KL divergence penalty weight (default: 1.5 for quality preservation)",
     )
     parser.add_argument(
         "--mu-ouroboros",
