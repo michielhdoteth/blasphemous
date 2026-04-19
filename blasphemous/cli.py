@@ -30,8 +30,8 @@ Examples:
         "--trials",
         "-t",
         type=int,
-        default=200,
-        help="Number of Optuna TPE trials (default: 200)",
+        default=500,
+        help="Number of Optuna TPE trials (default: 500)",
     )
     parser.add_argument(
         "--lambda-kl",
@@ -55,11 +55,17 @@ Examples:
         "--quantization", default=None, choices=["bnb_4bit"], help="Quantization mode"
     )
     parser.add_argument(
-        "--method",
+"--method",
         "-m",
         default="projection",
         choices=["projection", "lora", "optimal_transport", "auto"],
         help="Core method: projection (default), lora, optimal_transport fallback, or auto.",
+    )
+    parser.add_argument(
+        "--aggressive",
+        "-a",
+        action="store_true",
+        help="Aggressive mode: max ablation weight, accept quality loss",
     )
     parser.add_argument(
         "--strategy",
@@ -122,8 +128,8 @@ Examples:
     parser.add_argument(
         "--max-trials",
         type=int,
-        default=100,
-        help="Maximum optimization trials (default: 100)",
+        default=500,
+        help="Maximum optimization trials (default: 500)",
     )
     # Multi-pass compensation
     parser.add_argument(

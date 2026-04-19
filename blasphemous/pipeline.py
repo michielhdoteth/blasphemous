@@ -39,7 +39,7 @@ def run(
     dtype: torch.dtype = torch.float16,
     quantization: Optional[str] = None,
     aggressive: bool = False,
-    max_trials: int = 100,
+    max_trials: int = 500,
     multi_pass: int = 5,
     target_all: bool = False,
     layer_tuning: bool = False,

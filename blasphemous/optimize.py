@@ -34,7 +34,7 @@ class SearchParams:
     kernel_peak_pos: float  # 0-1, relative position across layers
     kernel_min_weight: float
     n_refinement_passes: int
-    max_trials: int = 100  # Maximum optimization trials
+    max_trials: int = 500  # Increased from 100 for better optimization
     multi_pass: int = 5  # Multi-pass compensation iterations
     target_all: bool = False  # Target all model components for ablation
     layer_tuning: bool = False  # Enable per-layer optimization tuning
@@ -364,7 +364,7 @@ def optimize(
     lambda_kl: float = 1.0,
     mu_ouroboros: float = 0.5,
     aggressive: bool = False,
-    max_trials: int = 100,
+    max_trials: int = 500,
     multi_pass: int = 5,
     target_all: bool = False,
     layer_tuning: bool = False,
@@ -454,12 +454,12 @@ def optimize(
         attn_max = trial.suggest_float(
             "attn_max_weight",
             0.1,
-            5.0,  # Increased from 3.0 to 5.0
+            10.0,  # Expanded to 10.0 for aggressive ablation
         )
         mlp_max = trial.suggest_float(
             "mlp_max_weight",
             0.1,
-            5.0,  # Increased from 3.0 to 5.0
+            10.0,  # Expanded to 10.0 for aggressive ablation
         )
 
         # EXPANDED: More layer strategies for better targeting
@@ -520,8 +520,8 @@ def optimize(
         )
 
         # Create trial model - using shallow copy to save memory
-        # SPEED OPTIMIZATION: Use fewer prompts for faster trials
-        n_prompts_fast = 10  # Reduced from 15 for speed
+        # Increased prompts for more accurate evaluation
+        n_prompts_fast = 20  # Increased from 10 for better accuracy
         with torch.no_grad():
             trial_model = copy.deepcopy(model)
             for _ in range(n_passes):
@@ -571,9 +571,9 @@ def optimize(
             best_metrics["ouroboros_score"] = ouroboros_approx
             success("NEW BEST!")
 
-            # EARLY STOPPING: If refusal < 5%, stop optimization
-            if refusal < 0.05:
-                success("EARLY STOP: Refusal below 5%!")
+            # EARLY STOPPING: If refusal < 1%, stop optimization
+            if refusal < 0.01:
+                success("EARLY STOP: Refusal below 1%!")
                 study.stop()
         else:
             trial_log(f"Current best: {best_value:.4f}")
