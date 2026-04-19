@@ -135,7 +135,7 @@ def plot_residuals(
     if not PACMAP_AVAILABLE:
         raise ImportError("pacmap not installed. Install with: pip install pacmap")
 
-    from ..prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+    from ..train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 
     print("[BLASPHEMOUS] Generating residual visualizations...")
 

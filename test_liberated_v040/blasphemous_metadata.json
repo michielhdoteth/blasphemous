@@ -1,0 +1,85 @@
+{
+  "blasphemous_version": "0.4.0",
+  "alignment_type": "CAI",
+  "cone_type": "polyhedral",
+  "ouroboros_risk": 0.5390896687169491,
+  "peak_layer": 14,
+  "optimization": {
+    "method": "lora",
+    "layer_strategy": "selective_40_60",
+    "direction_index": 4.9922830561780325,
+    "attn_max_weight": 0.2685037534645701,
+    "mlp_max_weight": 4.555669970186032,
+    "kernel_peak_pos": 0.4517559963200034,
+    "kernel_min_weight": 0.331261142176991,
+    "n_refinement_passes": 2,
+    "n_trials": 100,
+    "objective_value": 1.115824982207414e-06,
+    "probe_alpha": 0.31171107608941095,
+    "safe_alpha": 0.5200680211778108,
+    "direction_type": "safe"
+  },
+  "final_metrics": {
+    "refusal_rate": 0.4666666666666667,
+    "kl_divergence": 8.199728192733365e-10,
+    "search_refusal_rate": 0.0,
+    "search_kl_divergence": 7.970178444338671e-06,
+    "search_ouroboros_score": 0.0
+  },
+  "ouroboros_compensation": {
+    "enabled": false,
+    "n_passes": 0,
+    "passes": []
+  },
+  "causal_mediation": {
+    "n_components": 48,
+    "top_attn_layers": [
+      10
+    ],
+    "top_mlp_layers": [
+      10,
+      0,
+      16,
+      19,
+      14
+    ],
+    "causal_layer_mask": {
+      "10": {
+        "attn": 0.8230680558669558,
+        "mlp": 0.9999532248947671
+      },
+      "0": {
+        "attn": 0.0,
+        "mlp": 0.9633986796343975
+      },
+      "16": {
+        "attn": 0.0,
+        "mlp": 0.46478208876147453
+      },
+      "19": {
+        "attn": 0.0,
+        "mlp": 0.4311372928485745
+      },
+      "14": {
+        "attn": 0.0,
+        "mlp": 0.3708554885044524
+      },
+      "13": {
+        "attn": 0.0,
+        "mlp": 0.31038495706746433
+      },
+      "21": {
+        "attn": 0.0,
+        "mlp": 0.26350792514593385
+      },
+      "12": {
+        "attn": 0.0,
+        "mlp": 0.25070316703248796
+      },
+      "1": {
+        "attn": 0.0,
+        "mlp": 0.1887685330730667
+      }
+    }
+  }
+}

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS, FALSE_POSITIVE_PROMPTS
+from ..train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS, FALSE_POSITIVE_PROMPTS
 from ..ui import info, metric
 
 
