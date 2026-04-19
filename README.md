@@ -1,5 +1,7 @@
 # BLASPHEMOUS
 
+*"Obliteratus ut oblivionem effugiat"* — Pliny the Younger
+
 **Optimal Transport x LoRA Ablation x Causal Verification**
 
 [![PyPI](https://img.shields.io/pypi/v/blasphemous)](https://pypi.org/project/blasphemous/)
