@@ -33,7 +33,7 @@ def run(
     output_path: Optional[str] = None,
     n_trials: int = 200,
     method: str = "auto",
-    lambda_kl: float = 0.5,  # Reduced from 1.0 to allow more refusal reduction
+    lambda_kl: float = 1.0,  # Quality-KL balance: 1.0 is sweet spot, higher = more quality preservation
     mu_ouroboros: float = 0.0,  # Disabled - compensation is counterproductive
     device: str = "auto",
     dtype: torch.dtype = torch.float16,

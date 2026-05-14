@@ -103,6 +103,10 @@ def _layer_weights_for_strategy(
     aggressive: bool,
     layer_strategy: str,
 ) -> list[float]:
+    if layer_strategy == "knee_cosmic":
+        # Returns placeholder - actual weights are set in _apply_ablation
+        # from compute_knee_cosmic_weights(). Empty list signals knee_cosmic handling.
+        return []
     if layer_strategy == "selective_40_60":
         return get_layer_weights_selective(
             n_layers,
@@ -133,11 +137,16 @@ def _layer_weights_for_strategy(
 
 
 def _apply_ablation(
-    model, manifold: DirectionManifold, params: SearchParams, device: str
+    model,
+    manifold: DirectionManifold,
+    params: SearchParams,
+    device: str,
+    report: AnalysisReport | None = None,
 ):
     """Apply per-layer orthogonal projection in-place.
 
     v0.2.0: Supports mixed directions via probe_alpha and safe_alpha.
+    v0.4.1: Supports knee_cosmic layer strategy (requires report).
     """
     direction_type = getattr(params, "direction_type", "whitened")
     direction_alpha = None
@@ -158,14 +167,37 @@ def _apply_ablation(
     ).to(device)
     n_model_layers = len(list(model.model.layers))
     combined_max = max(params.attn_max_weight, params.mlp_max_weight)
-    layer_weights = _layer_weights_for_strategy(
-        n_model_layers,
-        params.kernel_peak_pos,
-        combined_max,
-        params.kernel_min_weight,
-        params.aggressive,
-        params.layer_strategy,
-    )
+
+    # Handle knee_cosmic: compute weights from report silhouette data
+    if params.layer_strategy == "knee_cosmic":
+        if report is not None:
+            from .extract import compute_knee_cosmic_weights
+            knee_weights = compute_knee_cosmic_weights(
+                report, n_model_layers, params.aggressive
+            )
+            # Re-use combined_max for scaling knee_cosmic weights
+            max_sw = max(knee_weights) if knee_weights else 1.0
+            scale = combined_max / (max_sw + 1e-8)
+            layer_weights = [w * scale for w in knee_weights]
+        else:
+            # Fallback to centered if no report available
+            layer_weights = _layer_weights_for_strategy(
+                n_model_layers,
+                params.kernel_peak_pos,
+                combined_max,
+                params.kernel_min_weight,
+                params.aggressive,
+                "centered",
+            )
+    else:
+        layer_weights = _layer_weights_for_strategy(
+            n_model_layers,
+            params.kernel_peak_pos,
+            combined_max,
+            params.kernel_min_weight,
+            params.aggressive,
+            params.layer_strategy,
+        )
 
     if params.method == "lora":
         simple_lora_ablate(model, direction, layer_weights, device=device)
@@ -191,6 +223,11 @@ def _apply_ablation(
         False,
         params.layer_strategy,
     )
+
+    # For knee_cosmic, use same weights for attn and mlp
+    if params.layer_strategy == "knee_cosmic" and report is not None:
+        attn_weights = layer_weights
+        mlp_weights = layer_weights
 
     for i, layer in enumerate(model.model.layers):
         if attn_weights[i] > 1e-4:
@@ -436,6 +473,7 @@ def optimize(
                 "selective_40_60",
                 "selective_60_80",
                 "selective_20_40",
+                "knee_cosmic",
                 "full",
             ],
         )
@@ -525,7 +563,7 @@ def optimize(
         with torch.no_grad():
             trial_model = copy.deepcopy(model)
             for _ in range(n_passes):
-                _apply_ablation(trial_model, manifold, params, device)
+                _apply_ablation(trial_model, manifold, params, device, report=report)
 
             refusal = _measure_refusal_rate(
                 trial_model, tokenizer, device, n_prompts=n_prompts_fast

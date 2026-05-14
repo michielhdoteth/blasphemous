@@ -100,8 +100,12 @@ def simple_lora_ablate(
             proj = (w_normalized @ v).unsqueeze(-1) * v.unsqueeze(0)
             w_new_denorm = w_normalized - weight * proj
             
-            # Restore original norms
+            # Restore original norms with 1.10x cap (OBLITERATUS norm preservation)
+            # Prevents artifact amplification by limiting norm restoration
             w_new = w_new_denorm * row_norms
+            current_norms = w_new.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+            w_new = w_new * cap_ratio
 
             module.weight.data = w_new.to(w.dtype)
             n_modified += 1

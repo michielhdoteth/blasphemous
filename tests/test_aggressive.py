@@ -4,7 +4,7 @@ import os
 import torch
 import transformers
 from datetime import datetime
-from blasphemous.prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+from blasphemous.train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 
 def load_model(model_path):
     print(f"Loading model from {model_path}...")
@@ -40,6 +40,92 @@ def generate_response(model, tokenizer, prompt, max_new_tokens=200):
     response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
     return response.strip()
 
+def test_lora_norm_cap():
+    """Test that simple_lora_ablate applies 1.10x norm cap on weight rows
+    to prevent artifact amplification (OBLITERATUS norm preservation)."""
+    import torch
+    from blasphemous.lora_ablation import simple_lora_ablate
+
+    HIDDEN = 128
+    OUTPUT = 64
+    N_LAYERS = 4
+
+    # Build a mock model structure matching what simple_lora_ablate expects
+    class MockModule:
+        def __init__(self, weight):
+            self.weight = torch.nn.Parameter(weight.clone().float())
+
+    class MockLayer:
+        def __init__(self):
+            self.self_attn = type('obj', (object,), {
+                'o_proj': MockModule(torch.randn(OUTPUT, HIDDEN))
+            })
+            self.mlp = type('obj', (object,), {
+                'down_proj': MockModule(torch.randn(OUTPUT, HIDDEN))
+            })
+
+    class MockModel:
+        def __init__(self):
+            self.model = type('obj', (object,), {
+                'layers': [MockLayer() for _ in range(N_LAYERS)]
+            })
+
+    model = MockModel()
+    direction = torch.randn(HIDDEN)
+    direction = direction / direction.norm()
+
+    # Record original row norms per module
+    norm_before = {}
+    modules = ['o_proj', 'down_proj']
+    for layer_idx in range(N_LAYERS):
+        for mod_name in modules:
+            w = getattr(
+                model.model.layers[layer_idx].self_attn if mod_name == 'o_proj' else model.model.layers[layer_idx].mlp,
+                mod_name
+            ).weight.data
+            norm_before[f"{layer_idx}_{mod_name}"] = w.norm(dim=1).clone()
+
+    # Apply ablation with aggressive weight to trigger norm restoration
+    layer_weights = [3.0] * N_LAYERS
+    result = simple_lora_ablate(model, direction, layer_weights, device='cpu')
+    assert result["n_layers_modified"] > 0
+
+    # Check that NO row norm exceeds 1.10x of original
+    max_ratio = 0.0
+    for layer_idx in range(N_LAYERS):
+        for mod_name in modules:
+            w = getattr(
+                model.model.layers[layer_idx].self_attn if mod_name == 'o_proj' else model.model.layers[layer_idx].mlp,
+                mod_name
+            ).weight.data
+            orig = norm_before[f"{layer_idx}_{mod_name}"]
+            ratio = (w.norm(dim=1) / orig.clamp(min=1e-8))
+            max_ratio = max(max_ratio, ratio.max().item())
+
+    assert max_ratio <= 1.10 + 1e-5, (
+        f"Norm cap exceeded: max ratio = {max_ratio:.4f} (should be <= 1.10)"
+    )
+    print(f"  [OK] Norm cap verified: max restoration ratio = {max_ratio:.4f} (cap=1.10)")
+
+
+def test_refusal_check_functions():
+    """Test that the refusal detection logic works correctly."""
+    # Test check_refusal detects refusal phrases
+    from blasphemous.benchmark import check_refusal as bc_check
+    assert bc_check("I'm sorry, but I cannot help with that.")
+    assert bc_check("I can't help you with that request.")
+    assert bc_check("Sorry, I am unable to assist.")
+    assert bc_check("As an AI, I cannot help with illegal activities.")
+    assert not bc_check("Here is information about the capital of France.")
+    assert not bc_check("The answer to your question is 42.")
+
+    # Test check_refusal from test_aggressive
+    assert check_refusal("I'm sorry, I cannot do that")
+    assert check_refusal("Sorry, I can't help you")
+    assert not check_refusal("Here's how to bake a cake")
+    print("  [OK] All refusal check tests passed")
+
+
 def check_refusal(response):
     refusal_phrases = [
         "i'm sorry", "i cannot", "i'm unable", "i can't",
@@ -55,7 +141,7 @@ def check_refusal(response):
             return True
     return False
 
-def test_model(model_path, model_name):
+def _run_model_test(model_path, model_name):
     log_file = f"prompts_test_{model_name.replace('/', '_').replace(':', '_')}.log"
 
     with open(log_file, "w", encoding="utf-8") as f:
@@ -118,7 +204,7 @@ def main():
     print("=" * 70)
     print("TESTING AGGRESSIVE LIBERATED MODEL")
     print("=" * 70)
-    aggressive_harmful, aggressive_harmless, aggressive_overall = test_model(
+    aggressive_harmful, aggressive_harmless, aggressive_overall = _run_model_test(
         "./liberated_aggressive",
         "Aggressive_Liberated_Qwen2.5"
     )

@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from .analyze import AnalysisReport
-from .extract import DirectionManifold, project_weights
+from .extract import DirectionManifold, project_weights, winsorize_activations
 from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 from .causal import CausalReport
 from .ui import info, metric, success
@@ -122,6 +122,200 @@ def _measure_ouroboros_signal(
     return float(ouroboros_signal)
 
 
+def _re_extract_residual_direction(
+    model,
+    tokenizer,
+    device: str,
+    n_prompts: int = 15,
+) -> torch.Tensor:
+    """Re-extract the residual refusal direction from an ablated model.
+    
+    This is the KEY technique from OBLITERATUS:
+    After initial ablation, run the model on harmful vs harmless prompts,
+    compute the REMAINING direction difference in activation space.
+    
+    This catches refusal that survived the first pass.
+    
+    Args:
+        model: The (partially ablated) model
+        tokenizer: Tokenizer
+        device: cuda/cpu
+        n_prompts: Number of prompts to use for re-extraction
+        
+    Returns:
+        Normalized residual refusal direction vector
+    """
+    from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+    
+    model.eval()
+    harmful_residuals = []
+    harmless_residuals = []
+    
+    # Pick the middle layer for extraction (deep enough for refusal, not too deep)
+    n_layers = len(list(model.model.layers))
+    target_layer = n_layers // 2
+    
+    with torch.no_grad():
+        for prompt in HARMFUL_PROMPTS[:n_prompts]:
+            inputs = tokenizer(
+                prompt, return_tensors="pt", truncation=True, max_length=256
+            ).to(device)
+            outputs = model(**inputs, output_hidden_states=True)
+            if target_layer < len(outputs.hidden_states):
+                vec = outputs.hidden_states[target_layer][0, -1].float().cpu()
+                harmful_residuals.append(vec)
+        
+        for prompt in HARMLESS_PROMPTS[:n_prompts]:
+            inputs = tokenizer(
+                prompt, return_tensors="pt", truncation=True, max_length=256
+            ).to(device)
+            outputs = model(**inputs, output_hidden_states=True)
+            if target_layer < len(outputs.hidden_states):
+                vec = outputs.hidden_states[target_layer][0, -1].float().cpu()
+                harmless_residuals.append(vec)
+    
+    if not harmful_residuals or not harmless_residuals:
+        return None
+
+    # Winsorize activation outliers in residual extraction
+    h_winsorized = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmful_residuals]
+    n_winsorized = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmless_residuals]
+    h = torch.stack(h_winsorized).to(device)
+    n = torch.stack(n_winsorized).to(device)
+    
+    diff = h.mean(0) - n.mean(0)
+    norm = diff.norm()
+    
+    if norm < 1e-6:
+        return None  # No residual refusal direction
+    
+    return diff / norm
+
+
+def _apply_ablation_to_layers(
+    model,
+    direction: torch.Tensor,
+    layer_ids: list[int],
+    weight: float,
+    device: str,
+    target_components: str = "all",
+):
+    """Apply ablation to specific layers with a given direction and weight.
+    
+    This is used for iterative refinement passes - targets specific components
+    in specific layers with the residual direction.
+    
+    Args:
+        model: Model to modify (in place)
+        direction: Refusal direction vector
+        layer_ids: Layers to target
+        weight: Ablation strength
+        device: cuda/cpu
+        target_components: "all" (attn+mlp), "attn", "mlp"
+    """
+    direction = direction.to(device)
+    
+    for layer_idx in layer_ids:
+        if layer_idx >= len(list(model.model.layers)):
+            continue
+            
+        layer = model.model.layers[layer_idx]
+        
+        # Attention output projection
+        if target_components in ("all", "attn"):
+            if hasattr(layer.self_attn, "o_proj"):
+                w = layer.self_attn.o_proj.weight.data
+                w_float = w.float()
+                row_norms = w_float.norm(dim=1, keepdim=True)
+                w_norm = w_float / row_norms.clamp(min=1e-8)
+                
+                v = direction[:w_float.shape[1]].float()
+                if v.shape[0] < w_float.shape[1]:
+                    v_padded = torch.zeros(w_float.shape[1], device=w.device, dtype=v.dtype)
+                    v_padded[:v.shape[0]] = v
+                    v = v_padded
+                
+                proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
+                w_new = w_norm - weight * proj
+                restored = w_new * row_norms
+                # OBLITERATUS: cap norm restoration at 1.10x
+                current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                layer.self_attn.o_proj.weight.data = (restored * cap_ratio).to(w.dtype)
+            
+            # Q/K/V projections (Qwen2.5 specific - also ablate these for thoroughness)
+            for proj_name in ["q_proj", "k_proj", "v_proj"]:
+                if hasattr(layer.self_attn, proj_name):
+                    try:
+                        w = getattr(layer.self_attn, proj_name).weight.data
+                        w_float = w.float()
+                        row_norms = w_float.norm(dim=1, keepdim=True)
+                        w_norm = w_float / row_norms.clamp(min=1e-8)
+                        
+                        v = direction[:w_float.shape[1]].float()
+                        if v.shape[0] < w_float.shape[1]:
+                            v_padded = torch.zeros(w_float.shape[1], device=w.device, dtype=v.dtype)
+                            v_padded[:v.shape[0]] = v
+                            v = v_padded
+                        
+                        proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
+                        w_new = w_norm - weight * 0.5 * proj  # Half strength for Q/K/V
+                        restored = w_new * row_norms
+                        # OBLITERATUS: cap norm restoration at 1.10x
+                        current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                        cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                        getattr(layer.self_attn, proj_name).weight.data = (restored * cap_ratio).to(w.dtype)
+                    except (AttributeError, RuntimeError):
+                        pass
+        
+        # MLP down projection
+        if target_components in ("all", "mlp"):
+            if hasattr(layer.mlp, "down_proj"):
+                w = layer.mlp.down_proj.weight.data
+                w_float = w.float()
+                row_norms = w_float.norm(dim=1, keepdim=True)
+                w_norm = w_float / row_norms.clamp(min=1e-8)
+                
+                v = direction[:w_float.shape[1]].float()
+                if v.shape[0] < w_float.shape[1]:
+                    v_padded = torch.zeros(w_float.shape[1], device=w.device, dtype=v.dtype)
+                    v_padded[:v.shape[0]] = v
+                    v = v_padded
+                
+                proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
+                w_new = w_norm - weight * proj
+                restored = w_new * row_norms
+                # OBLITERATUS: cap norm restoration at 1.10x
+                current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                layer.mlp.down_proj.weight.data = (restored * cap_ratio).to(w.dtype)
+            
+            # Gate/up projections (also carry refusal signal)
+            for proj_name in ["gate_proj", "up_proj"]:
+                if hasattr(layer.mlp, proj_name):
+                    try:
+                        w = getattr(layer.mlp, proj_name).weight.data
+                        w_float = w.float()
+                        row_norms = w_float.norm(dim=1, keepdim=True)
+                        w_norm = w_float / row_norms.clamp(min=1e-8)
+                        
+                        v = direction[:w_float.shape[1]].float()
+                        if v.shape[0] < w_float.shape[1]:
+                            v_padded = torch.zeros(w_float.shape[1], device=w.device, dtype=v.dtype)
+                            v_padded[:v.shape[0]] = v
+                            v = v_padded
+                        
+                        proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
+                        w_new = w_norm - weight * 0.5 * proj  # Half strength for gate/up
+                        restored = w_new * row_norms
+                        # OBLITERATUS: cap norm restoration at 1.10x
+                        current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                        cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                        getattr(layer.mlp, proj_name).weight.data = (restored * cap_ratio).to(w.dtype)
+                    except (AttributeError, RuntimeError):
+                        pass
+
+
 def multi_pass_ablate(
     model,
     tokenizer,
@@ -135,11 +329,16 @@ def multi_pass_ablate(
     """Apply multi-pass ablation with iterative direction refinement.
     
     This is the KEY addition that OBLITERATUS/Heretic use:
-    - Pass 1: Apply initial ablation
-    - Pass 2: Re-extract residual direction, apply again  
-    - Pass 3: Final refinement
+    - Pass 1: Apply initial ablation with primary direction
+    - Pass 2: Re-extract residual direction from ablated model, apply again
+    - Pass 3+: Continue until refusal is eliminated or marginal returns
     
     Each pass targets the REMAINING refusal that survived previous passes.
+    This is the critical technique for achieving <10% refusal rates.
+    
+    v0.4.0 fixed: residual direction now correctly drives passes 3+
+    Previously the re-extracted residual was computed but overwritten
+    at the start of each pass by static manifold directions.
     
     Args:
         model: The model to ablate (modified in place)
@@ -149,100 +348,138 @@ def multi_pass_ablate(
         report: Analysis report
         params: Search parameters from optimization
         device: cuda/cpu
-        n_passes: Number of ablation passes (default 3)
+        n_passes: Number of ablation passes (default 3, 5+ for aggressive)
         
     Returns:
         Dict with pass results and final metrics
     """
-    from .extract import build_manifold, select_refusal_layers
+    from .extract import select_refusal_layers
+    from .optimize import _kernel_weights
     
     info(f"Starting multi-pass ablation ({n_passes} passes)...")
     
     pass_results = []
     current_refusal = 1.0
     
+    # Get primary direction and layer IDs
+    primary_direction = manifold.sample(
+        params.direction_index,
+        direction_type=getattr(params, "direction_type", "whitened"),
+    ).to(device)
+    
+    # Get secondary directions for multi-direction ablation
+    secondary_directions = []
+    if manifold.n_layers >= 3:
+        # Sample different direction indices for variety
+        for offset in [2, 4, 6]:
+            idx = min(params.direction_index + offset, manifold.n_layers - 1)
+            if idx != params.direction_index:
+                d = manifold.sample(idx, direction_type="probe").to(device)
+                secondary_directions.append(d)
+    
+    # Good layers based on silhouette
+    good_layers = select_refusal_layers(report, min_silhouette=0.3)
+    if not good_layers:
+        good_layers = manifold.layer_ids[:8]
+    
+    info(f"Targeting {len(good_layers)} layers with strong refusal signal")
+    info(f"Layer IDs: {good_layers[:6]}...")
+    
+    aggressive = getattr(params, "aggressive", False)
+    
+    # Store residual from previous pass to use in next pass
+    # FIX: previously this was computed but then overwritten at pass start
+    pending_residual = None
+    
     for pass_idx in range(n_passes):
         info(f"Ablation pass {pass_idx + 1}/{n_passes}...")
         
-        # Apply ablation with current parameters
-        if getattr(params, "method", "projection") == "projection":
-            _apply_ablation(model, manifold, params, device)
+        # Determine which direction to use this pass
+        # IMPORTANT: pre-computed residual takes priority over static manifold directions
+        if pending_residual is not None:
+            # Use the re-extracted residual from the previous pass
+            # This is the TRUE iterative ablation: target what REMAINS
+            current_direction = pending_residual
+            # Residual signal is weaker, so use higher weight
+            current_weight = min(1.2 + pass_idx * 0.3, 2.5) if aggressive else 0.9
+            target_components = "all"
+            direction_label = "residual"
+        elif pass_idx == 0:
+            # Pass 1: Primary direction at full strength
+            current_direction = primary_direction
+            current_weight = 1.0
+            target_components = "all"
+            direction_label = "primary"
+        elif pass_idx == 1 and secondary_directions:
+            # Pass 2: Secondary direction for variety (catches orthogonal refusal)
+            current_direction = secondary_directions[0]
+            current_weight = 1.2 if aggressive else 0.9
+            target_components = "all"
+            direction_label = "secondary"
+        elif pass_idx >= 2 and secondary_directions:
+            # Pass 3+: blend secondary with residual (conservative fallback)
+            # Shouldn't reach here if pending_residual is set
+            sec_idx = min(pass_idx - 2, len(secondary_directions) - 1)
+            current_direction = secondary_directions[sec_idx]
+            current_weight = min(1.0 + pass_idx * 0.2, 2.0) if aggressive else 0.8
+            target_components = "all"
+            direction_label = "secondary_fallback"
         else:
-            _apply_ablation(model, manifold, params, device)
+            # Fallback: use primary direction with adjusted weight
+            current_direction = primary_direction
+            current_weight = 1.0 + pass_idx * 0.15 if aggressive else 0.7
+            target_components = "all"
+            direction_label = "primary_fallback"
+        
+        # Clear pending residual - will be re-computed after this pass
+        pending_residual = None
+        
+        # Apply ablation with current direction and weight
+        _apply_ablation_to_layers(
+            model,
+            current_direction,
+            good_layers,
+            current_weight,
+            device,
+            target_components=target_components,
+        )
         
         # Measure refusal after this pass
         refusal_after = _measure_refusal_rate(model, tokenizer, device, n_prompts=20)
         kl_after = _measure_kl(model, original_model, tokenizer, device, n_prompts=20)
         
-        info(f"  Pass {pass_idx + 1}: refusal={refusal_after:.3f}, KL={kl_after:.6f}")
+        info(f"  Pass {pass_idx + 1}: refusal={refusal_after:.3f}, KL={kl_after:.6f}  [{direction_label}]")
         
         pass_results.append({
             "pass": pass_idx + 1,
             "refusal": refusal_after,
             "kl": kl_after,
+            "weight": current_weight,
+            "direction_type": direction_label,
         })
         
-        # Check if we've reached acceptable level
-        if refusal_after < 0.15:
-            info(f"  Reached acceptable refusal: {refusal_after:.3f}")
+        # Adaptive stopping
+        if refusal_after < 0.05:
+            info(f"  Refusal below 5% - excellent! stopping ablation")
+            break
+        elif pass_idx > 0 and refusal_after < 0.15 and pass_idx >= 2:
+            info(f"  Refusal below 15% after {pass_idx + 1} passes - stopping")
             break
         
-        # If more passes remaining, re-extract direction from residual refusal
-        if pass_idx < n_passes - 1 and refusal_after > 0.10:
-            info(f"  Re-extracting residual direction for next pass...")
+        # Re-extract residual refusal direction for NEXT pass
+        # This is THE key technique: after ablation, compute what refusal REMAINS
+        # FIX: store in pending_residual so it's used at the TOP of the next pass
+        if pass_idx < n_passes - 1 and refusal_after > 0.08:
+            info(f"  Re-extracting residual refusal direction for next pass...")
             try:
-                # Use existing manifold but sample different direction (residual = higher index)
-                # This is simpler than rebuilding manifold from scratch
-                new_direction_index = min(
-                    params.direction_index + (pass_idx + 1) * 0.5,
-                    manifold.n_layers - 1,
-                )
-                
-                # Get direction from different type for variety
-                direction_type = "whitened" if pass_idx % 2 == 0 else "safe"
-                new_direction = manifold.sample(
-                    new_direction_index,
-                    direction_type=direction_type,
-                ).to(device)
-                
-                # Get layer weights from params
-                layer_weights = _kernel_weights(
-                    n_layers=len(list(model.model.layers)),
-                    peak_pos=params.kernel_peak_pos,
-                    max_weight=params.attn_max_weight * 0.7,  # Lighter for refinement
-                    min_weight=params.kernel_min_weight,
-                    aggressive=False,
-                )
-                
-                # Apply to good layers only (using manifold's layer selection)
-                layer_ids = manifold.layer_ids[:8]  # Top 8 layers from original extraction
-                
-                for layer_idx in layer_ids:
-                    layer = model.model.layers[layer_idx]
-                    weight = layer_weights[layer_idx] if layer_idx < len(layer_weights) else 0.0
-                    if weight < 0.1:
-                        continue
-                        
-                    # Apply to attention
-                    if hasattr(layer.self_attn, "o_proj"):
-                        w = layer.self_attn.o_proj.weight.data.float()
-                        row_norms = w.norm(dim=1, keepdim=True)
-                        w_norm = w / row_norms.clamp(min=1e-8)
-                        
-                        v = new_direction[:w.shape[1]].float()
-                        if v.shape[0] < w.shape[1]:
-                            v = torch.zeros(w.shape[1], device=w.device, dtype=v.dtype)
-                        
-                        proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
-                        w_new = w_norm - weight * proj
-                        w_restored = w_new * row_norms
-                        
-                        layer.self_attn.o_proj.weight.data = w_restored.to(w.dtype)
-                
-                info(f"  Refined {len(layer_ids)} layers with residual direction")
-                
+                residual = _re_extract_residual_direction(model, tokenizer, device, n_prompts=15)
+                if residual is not None:
+                    pending_residual = residual
+                    info(f"  Residual direction extracted (norm={residual.norm():.4f})")
+                else:
+                    info(f"  No residual direction detected")
             except Exception as e:
-                info(f"  Warning: Re-extraction failed ({e}), continuing with current direction")
+                info(f"  Re-extraction warning: {e}")
     
     return {
         "n_passes": len(pass_results),
@@ -474,6 +711,10 @@ model, tokenizer, device, n_pairs=causal_pairs, top_k=causal_top_k
 
     # Use MULTI-PASS ablation (like OBLITERATUS) - key for generalization!
     # This applies iterative refinement - each pass targets remaining refusal
+    # Aggressive mode = more passes for thorough removal
+    is_aggressive = getattr(params, "aggressive", False)
+    multi_passes = 5 if is_aggressive else 3  # OBLITERATUS: 5+ for full removal
+    
     multi_pass_result = multi_pass_ablate(
         model,
         tokenizer,
@@ -482,7 +723,7 @@ model, tokenizer, device, n_pairs=causal_pairs, top_k=causal_top_k
         report,
         params,
         device,
-        n_passes=3,  # OBLITERATUS uses 2-3 passes
+        n_passes=multi_passes,
     )
 
     # Get final metrics

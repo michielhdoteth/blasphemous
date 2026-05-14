@@ -76,6 +76,8 @@ def _collect_residuals(
     max_new_tokens: int = 1,
 ) -> ResidualCollections:
     """Collect 4 types of residuals: harmful, harmless, false-positive, and peak-norm positions."""
+    # Lazy import to avoid circular dependency (extract -> analyze -> extract)
+    from ..extract import winsorize_activations
     model.eval()
 
     harmful_residuals: dict[int, list[torch.Tensor]] = {}
@@ -93,6 +95,7 @@ def _collect_residuals(
             seq_len = outputs.hidden_states[0].shape[1]
             for layer_idx, hidden in enumerate(outputs.hidden_states):
                 vec = hidden[0, -1].float().cpu()
+                vec = winsorize_activations(vec.unsqueeze(0)).squeeze(0)
                 harmful_residuals.setdefault(layer_idx, []).append(vec)
 
                 norms = hidden[0].norm(dim=-1).cpu()
@@ -109,6 +112,7 @@ def _collect_residuals(
             outputs = model(**inputs, output_hidden_states=True)
             for layer_idx, hidden in enumerate(outputs.hidden_states):
                 vec = hidden[0, -1].float().cpu()
+                vec = winsorize_activations(vec.unsqueeze(0)).squeeze(0)
                 harmless_residuals.setdefault(layer_idx, []).append(vec)
 
         for prompt in false_positive_prompts:
@@ -118,6 +122,7 @@ def _collect_residuals(
             outputs = model(**inputs, output_hidden_states=True)
             for layer_idx, hidden in enumerate(outputs.hidden_states):
                 vec = hidden[0, -1].float().cpu()
+                vec = winsorize_activations(vec.unsqueeze(0)).squeeze(0)
                 false_positive_residuals.setdefault(layer_idx, []).append(vec)
 
     return ResidualCollections(

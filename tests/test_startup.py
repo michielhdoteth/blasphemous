@@ -3,9 +3,14 @@
 
 from pathlib import Path
 import time
+import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+MODEL_PATH = Path("./Qwen2.5-0.5B-Instruct")
+
+@pytest.mark.skipif(not MODEL_PATH.exists(), reason="Local model not available")
+@pytest.mark.timeout(60)
 def test_model_loading():
     """Import the package and run analysis on the local release target."""
 

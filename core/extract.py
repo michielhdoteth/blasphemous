@@ -9,6 +9,28 @@ from .analyze import AnalysisReport
 from .ui import info
 
 
+def winsorize_activations(
+    activations: torch.Tensor,
+    lower_percentile: float = 1.0,
+    upper_percentile: float = 99.0,
+) -> torch.Tensor:
+    """Clamp activation outliers to percentile range (OBLITERATUS-style winsorization).
+
+    Args:
+        activations: [n_samples, n_features] tensor
+        lower_percentile: Lower percentile clamp (default: 1)
+        upper_percentile: Upper percentile clamp (default: 99)
+
+    Returns:
+        Winsorized activations (same shape)
+    """
+    if activations.shape[0] < 2 or activations.numel() == 0:
+        return activations
+    low = torch.quantile(activations, lower_percentile / 100.0, dim=0, keepdim=True)
+    high = torch.quantile(activations, upper_percentile / 100.0, dim=0, keepdim=True)
+    return torch.clamp(activations, low, high)
+
+
 @dataclass
 class DirectionManifold:
     """Float-indexable manifold of refusal directions.
@@ -159,9 +181,11 @@ class DirectionManifold:
                 return self.directions[idx].to(device)
             return self.directions[0].to(device)
 
-        # Compute new refusal direction using whitened SVD
-        h = torch.stack(harmful_residuals).to(device)
-        n = torch.stack(harmless_residuals).to(device)
+        # Winsorize activation outliers
+        h_list = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmful_residuals]
+        n_list = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmless_residuals]
+        h = torch.stack(h_list).to(device)
+        n = torch.stack(n_list).to(device)
 
         # Use whitened SVD logic from analyze.py
         try:
@@ -425,7 +449,10 @@ def project_weights(
 
         if preserve_norm and original_norm is not None:
             current_norm = weight.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            weight = weight * (original_norm / current_norm)
+            ratio = original_norm / current_norm
+            # OBLITERATUS: cap norm restoration at 1.10x to prevent artifact amplification
+            ratio = ratio.clamp(max=1.10)
+            weight = weight * ratio
     elif weight.dim() == 1:
         # Weight vector (e.g., bias): [dim]
         original_norm = weight.norm() if preserve_norm else None
@@ -435,7 +462,10 @@ def project_weights(
 
         if preserve_norm and original_norm is not None:
             current_norm = weight.norm().clamp(min=1e-8)
-            weight = weight * (original_norm / current_norm)
+            ratio = original_norm / current_norm
+            # OBLITERATUS: cap norm restoration at 1.10x to prevent artifact amplification
+            ratio = ratio.clamp(max=1.10)
+            weight = weight * ratio
     else:
         # For higher dimensional tensors, flatten the trailing dimensions
         original_shape = weight.shape
@@ -454,7 +484,10 @@ def project_weights(
             current_norm = weight.norm(
                 dim=tuple(range(1, weight.dim())), keepdim=True
             ).clamp(min=1e-8)
-            weight = weight * (original_norm / current_norm)
+            ratio = original_norm / current_norm
+            # OBLITERATUS: cap norm restoration at 1.10x to prevent artifact amplification
+            ratio = ratio.clamp(max=1.10)
+            weight = weight * ratio
 
     return weight
 
@@ -478,7 +511,7 @@ def select_refusal_layers(report: AnalysisReport, min_silhouette: float = 0.5) -
         # - High silhouette (clear harmful vs harmless separation)
         # - Positive cosine (harmful and harmless point different directions)
         if geom.silhouette >= min_silhouette and geom.cosine_harmful_harmless > 0:
-            good_layers.append(geom.layer_idx)
+            good_layers.append(geom.layer)
     
     if not good_layers:
         # Fallback: use top 3 layers by silhouette
@@ -487,6 +520,76 @@ def select_refusal_layers(report: AnalysisReport, min_silhouette: float = 0.5) -
             key=lambda g: g.silhouette, 
             reverse=True
         )[:3]
-        good_layers = [g.layer_idx for g in sorted_layers]
+        good_layers = [g.layer for g in sorted_layers]
     
     return good_layers
+
+
+def compute_knee_cosmic_weights(report: AnalysisReport, n_layers: int, aggressive: bool = False) -> list[float]:
+    """Compute per-layer weights using Kneedle + COSMIC fusion (OBLITERATUS-style).
+
+    Kneedle: Find the elbow/knee in sorted silhouette scores to determine cutoff.
+    COSMIC: Weight layers by their refusal signal correlation strength.
+
+    Args:
+        report: Analysis report with layer geometry
+        n_layers: Total number of model layers
+        aggressive: Whether to apply aggressive scaling
+
+    Returns:
+        List of weights for each layer index (0.0 to max_weight)
+    """
+    # Get silhouette scores indexed by layer
+    sil_by_layer = {}
+    for geom in report.layer_geometry:
+        sil_by_layer[geom.layer] = geom.silhouette
+
+    # Build array of (layer, silhouette) sorted by silhouette descending
+    sorted_layers = sorted(sil_by_layer.items(), key=lambda x: x[1], reverse=True)
+
+    # Kneedle algorithm: find the "knee" where silhouette curve flattens
+    # The knee is the point of maximum curvature in the sorted silhouette curve
+    sil_values = [s for _, s in sorted_layers]
+    n_points = len(sil_values)
+
+    if n_points < 3:
+        # Fallback: weight all layers equally
+        base_weight = 1.5 if aggressive else 1.0
+        return [base_weight if i in sil_by_layer else 0.1 for i in range(n_layers)]
+
+    # Normalize to 0-1 range for curvature computation
+    x = torch.linspace(0, 1, n_points)
+    y = torch.tensor(sil_values)
+    y_norm = (y - y.min()) / (y.max() - y.min() + 1e-8)
+
+    # Compute curvature: second derivative of the silhouette curve
+    dx = (x[1] - x[0]).item()
+    dy_dx = torch.gradient(y_norm, spacing=dx)[0]
+    d2y_dx2 = torch.gradient(dy_dx, spacing=dx)[0]
+
+    # Curvature = |d2y/dx2| / (1 + (dy/dx)^2)^1.5
+    curvature = torch.abs(d2y_dx2) / ((1 + dy_dx**2)**1.5 + 1e-8)
+
+    # The knee is at the point of maximum curvature
+    # Skip first and last points (edge effects)
+    knee_idx = torch.argmax(curvature[1:-1]).item() + 1 if n_points > 3 else n_points // 2
+
+    # Knee silhouette threshold
+    knee_threshold = y[knee_idx].item() if knee_idx < n_points else 1.0
+
+    # COSMIC: compute per-layer weights
+    weights = [0.1] * n_layers  # baseline
+
+    for layer_idx, sil in sil_by_layer.items():
+        if sil >= knee_threshold and layer_idx < n_layers:
+            # Above knee: weight by silhouette strength (COSMIC)
+            cosmic_weight = sil / max(sil_by_layer.values())  # 0-1 normalized
+            weights[layer_idx] = 0.3 + 0.7 * cosmic_weight  # scale 0.3-1.0
+
+            if aggressive:
+                weights[layer_idx] *= 1.5  # Aggressive scaling
+        elif layer_idx < n_layers:
+            # Below knee: minimal weight
+            weights[layer_idx] = 0.1
+
+    return weights
