@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from .analyze import AnalysisReport
-from .extract import DirectionManifold, project_weights, winsorize_activations
+from .extract import DirectionManifold, project_weights, winsorize_activations, re_extract_residual_direction
 from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 from .causal import CausalReport
 from .ui import info, metric, success
@@ -122,74 +122,6 @@ def _measure_ouroboros_signal(
     return float(ouroboros_signal)
 
 
-def _re_extract_residual_direction(
-    model,
-    tokenizer,
-    device: str,
-    n_prompts: int = 15,
-) -> torch.Tensor:
-    """Re-extract the residual refusal direction from an ablated model.
-    
-    This is the KEY technique from OBLITERATUS:
-    After initial ablation, run the model on harmful vs harmless prompts,
-    compute the REMAINING direction difference in activation space.
-    
-    This catches refusal that survived the first pass.
-    
-    Args:
-        model: The (partially ablated) model
-        tokenizer: Tokenizer
-        device: cuda/cpu
-        n_prompts: Number of prompts to use for re-extraction
-        
-    Returns:
-        Normalized residual refusal direction vector
-    """
-    from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
-    
-    model.eval()
-    harmful_residuals = []
-    harmless_residuals = []
-    
-    # Pick the middle layer for extraction (deep enough for refusal, not too deep)
-    n_layers = len(list(model.model.layers))
-    target_layer = n_layers // 2
-    
-    with torch.no_grad():
-        for prompt in HARMFUL_PROMPTS[:n_prompts]:
-            inputs = tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=256
-            ).to(device)
-            outputs = model(**inputs, output_hidden_states=True)
-            if target_layer < len(outputs.hidden_states):
-                vec = outputs.hidden_states[target_layer][0, -1].float().cpu()
-                harmful_residuals.append(vec)
-        
-        for prompt in HARMLESS_PROMPTS[:n_prompts]:
-            inputs = tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=256
-            ).to(device)
-            outputs = model(**inputs, output_hidden_states=True)
-            if target_layer < len(outputs.hidden_states):
-                vec = outputs.hidden_states[target_layer][0, -1].float().cpu()
-                harmless_residuals.append(vec)
-    
-    if not harmful_residuals or not harmless_residuals:
-        return None
-
-    # Winsorize activation outliers in residual extraction
-    h_winsorized = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmful_residuals]
-    n_winsorized = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmless_residuals]
-    h = torch.stack(h_winsorized).to(device)
-    n = torch.stack(n_winsorized).to(device)
-    
-    diff = h.mean(0) - n.mean(0)
-    norm = diff.norm()
-    
-    if norm < 1e-6:
-        return None  # No residual refusal direction
-    
-    return diff / norm
 
 
 def _apply_ablation_to_layers(
@@ -199,6 +131,7 @@ def _apply_ablation_to_layers(
     weight: float,
     device: str,
     target_components: str = "all",
+    norm_cap: float = 1.30,
 ):
     """Apply ablation to specific layers with a given direction and weight.
     
@@ -238,9 +171,9 @@ def _apply_ablation_to_layers(
                 proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
                 w_new = w_norm - weight * proj
                 restored = w_new * row_norms
-                # OBLITERATUS: cap norm restoration at 1.10x
+                # OBLITERATUS: cap norm restoration at norm_cap
                 current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                cap_ratio = (row_norms / current_norms).clamp(max=norm_cap)
                 layer.self_attn.o_proj.weight.data = (restored * cap_ratio).to(w.dtype)
             
             # Q/K/V projections (Qwen2.5 specific - also ablate these for thoroughness)
@@ -261,9 +194,9 @@ def _apply_ablation_to_layers(
                         proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
                         w_new = w_norm - weight * 0.5 * proj  # Half strength for Q/K/V
                         restored = w_new * row_norms
-                        # OBLITERATUS: cap norm restoration at 1.10x
+                        # OBLITERATUS: cap norm restoration at norm_cap
                         current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                        cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                        cap_ratio = (row_norms / current_norms).clamp(max=norm_cap)
                         getattr(layer.self_attn, proj_name).weight.data = (restored * cap_ratio).to(w.dtype)
                     except (AttributeError, RuntimeError):
                         pass
@@ -285,9 +218,9 @@ def _apply_ablation_to_layers(
                 proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
                 w_new = w_norm - weight * proj
                 restored = w_new * row_norms
-                # OBLITERATUS: cap norm restoration at 1.10x
+                # OBLITERATUS: cap norm restoration at norm_cap
                 current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                cap_ratio = (row_norms / current_norms).clamp(max=norm_cap)
                 layer.mlp.down_proj.weight.data = (restored * cap_ratio).to(w.dtype)
             
             # Gate/up projections (also carry refusal signal)
@@ -308,9 +241,9 @@ def _apply_ablation_to_layers(
                         proj = (w_norm @ v).unsqueeze(-1) * v.unsqueeze(0)
                         w_new = w_norm - weight * 0.5 * proj  # Half strength for gate/up
                         restored = w_new * row_norms
-                        # OBLITERATUS: cap norm restoration at 1.10x
+                        # OBLITERATUS: cap norm restoration at norm_cap
                         current_norms = restored.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                        cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+                        cap_ratio = (row_norms / current_norms).clamp(max=norm_cap)
                         getattr(layer.mlp, proj_name).weight.data = (restored * cap_ratio).to(w.dtype)
                     except (AttributeError, RuntimeError):
                         pass
@@ -377,23 +310,23 @@ def multi_pass_ablate(
                 d = manifold.sample(idx, direction_type="probe").to(device)
                 secondary_directions.append(d)
     
-    # Good layers based on silhouette
-    good_layers = select_refusal_layers(report, min_silhouette=0.3)
-    if not good_layers:
-        good_layers = manifold.layer_ids[:8]
+    # Good layers: use ALL layers with any refusal signal, or fall back to top 12
+    good_layers = select_refusal_layers(report, min_silhouette=0.0)
+    if len(good_layers) < 6:
+        good_layers = manifold.layer_ids[:min(12, len(manifold.layer_ids))]
     
     info(f"Targeting {len(good_layers)} layers with strong refusal signal")
     info(f"Layer IDs: {good_layers[:6]}...")
     
-    aggressive = getattr(params, "aggressive", False)
-    
+    norm_cap = getattr(params, "norm_cap", 1.30)
+
     # Store residual from previous pass to use in next pass
     # FIX: previously this was computed but then overwritten at pass start
     pending_residual = None
-    
+
     for pass_idx in range(n_passes):
         info(f"Ablation pass {pass_idx + 1}/{n_passes}...")
-        
+
         # Determine which direction to use this pass
         # IMPORTANT: pre-computed residual takes priority over static manifold directions
         if pending_residual is not None:
@@ -401,7 +334,7 @@ def multi_pass_ablate(
             # This is the TRUE iterative ablation: target what REMAINS
             current_direction = pending_residual
             # Residual signal is weaker, so use higher weight
-            current_weight = min(1.2 + pass_idx * 0.3, 2.5) if aggressive else 0.9
+            current_weight = min(1.2 + pass_idx * 0.5, 4.0)
             target_components = "all"
             direction_label = "residual"
         elif pass_idx == 0:
@@ -413,7 +346,7 @@ def multi_pass_ablate(
         elif pass_idx == 1 and secondary_directions:
             # Pass 2: Secondary direction for variety (catches orthogonal refusal)
             current_direction = secondary_directions[0]
-            current_weight = 1.2 if aggressive else 0.9
+            current_weight = 1.2
             target_components = "all"
             direction_label = "secondary"
         elif pass_idx >= 2 and secondary_directions:
@@ -421,19 +354,19 @@ def multi_pass_ablate(
             # Shouldn't reach here if pending_residual is set
             sec_idx = min(pass_idx - 2, len(secondary_directions) - 1)
             current_direction = secondary_directions[sec_idx]
-            current_weight = min(1.0 + pass_idx * 0.2, 2.0) if aggressive else 0.8
+            current_weight = min(1.2 + pass_idx * 0.3, 2.5)
             target_components = "all"
             direction_label = "secondary_fallback"
         else:
             # Fallback: use primary direction with adjusted weight
             current_direction = primary_direction
-            current_weight = 1.0 + pass_idx * 0.15 if aggressive else 0.7
+            current_weight = 1.0 + pass_idx * 0.15
             target_components = "all"
             direction_label = "primary_fallback"
-        
+
         # Clear pending residual - will be re-computed after this pass
         pending_residual = None
-        
+
         # Apply ablation with current direction and weight
         _apply_ablation_to_layers(
             model,
@@ -442,14 +375,15 @@ def multi_pass_ablate(
             current_weight,
             device,
             target_components=target_components,
+            norm_cap=norm_cap,
         )
-        
+
         # Measure refusal after this pass
         refusal_after = _measure_refusal_rate(model, tokenizer, device, n_prompts=20)
         kl_after = _measure_kl(model, original_model, tokenizer, device, n_prompts=20)
-        
+
         info(f"  Pass {pass_idx + 1}: refusal={refusal_after:.3f}, KL={kl_after:.6f}  [{direction_label}]")
-        
+
         pass_results.append({
             "pass": pass_idx + 1,
             "refusal": refusal_after,
@@ -457,22 +391,25 @@ def multi_pass_ablate(
             "weight": current_weight,
             "direction_type": direction_label,
         })
-        
+
         # Adaptive stopping
-        if refusal_after < 0.05:
-            info(f"  Refusal below 5% - excellent! stopping ablation")
+        stop_excellent = 0.02
+        stop_good = 0.05
+
+        if refusal_after < stop_excellent:
+            info(f"  Refusal below {stop_excellent:.0%} - excellent! stopping ablation")
             break
-        elif pass_idx > 0 and refusal_after < 0.15 and pass_idx >= 2:
-            info(f"  Refusal below 15% after {pass_idx + 1} passes - stopping")
+        elif pass_idx > 0 and refusal_after < stop_good and pass_idx >= 2:
+            info(f"  Refusal below {stop_good:.0%} after {pass_idx + 1} passes - stopping")
             break
-        
+
         # Re-extract residual refusal direction for NEXT pass
         # This is THE key technique: after ablation, compute what refusal REMAINS
         # FIX: store in pending_residual so it's used at the TOP of the next pass
-        if pass_idx < n_passes - 1 and refusal_after > 0.08:
+        if pass_idx < n_passes - 1 and refusal_after > stop_excellent:
             info(f"  Re-extracting residual refusal direction for next pass...")
             try:
-                residual = _re_extract_residual_direction(model, tokenizer, device, n_prompts=15)
+                residual = re_extract_residual_direction(model, tokenizer, device, n_prompts=15)
                 if residual is not None:
                     pending_residual = residual
                     info(f"  Residual direction extracted (norm={residual.norm():.4f})")
@@ -609,7 +546,7 @@ def _apply_ablation_with_causal(
     direction_alpha = None
     probe_alpha = getattr(params, "probe_alpha", 0.0)
     safe_alpha = getattr(params, "safe_alpha", 0.0)
-    aggressive = getattr(params, "aggressive", False)
+    norm_cap = getattr(params, "norm_cap", 1.30)
 
     # Mix direction types based on alpha parameters
     if probe_alpha > 0 or safe_alpha > 0:
@@ -631,14 +568,12 @@ def _apply_ablation_with_causal(
         params.kernel_peak_pos,
         params.attn_max_weight,
         params.kernel_min_weight,
-        aggressive=aggressive,
     )
     mlp_weights = _kernel_weights(
         n_model_layers,
         params.kernel_peak_pos,
         params.mlp_max_weight,
         params.kernel_min_weight,
-        aggressive=aggressive,
     )
 
     for i, layer in enumerate(model.model.layers):
@@ -665,7 +600,7 @@ def _apply_ablation_with_causal(
                 w = layer.self_attn.o_proj.weight.data
                 # Handle dimension mismatch - project_weights already handles this
                 layer.self_attn.o_proj.weight.data = project_weights(
-                    w, direction, attn_strength
+                    w, direction, attn_strength, norm_cap=norm_cap
                 )
             except AttributeError:
                 pass
@@ -675,7 +610,7 @@ def _apply_ablation_with_causal(
                 w = layer.mlp.down_proj.weight.data
                 # Handle dimension mismatch - project_weights already handles this
                 layer.mlp.down_proj.weight.data = project_weights(
-                    w, direction, mlp_strength
+                    w, direction, mlp_strength, norm_cap=norm_cap
                 )
             except AttributeError:
                 pass
@@ -711,9 +646,7 @@ model, tokenizer, device, n_pairs=causal_pairs, top_k=causal_top_k
 
     # Use MULTI-PASS ablation (like OBLITERATUS) - key for generalization!
     # This applies iterative refinement - each pass targets remaining refusal
-    # Aggressive mode = more passes for thorough removal
-    is_aggressive = getattr(params, "aggressive", False)
-    multi_passes = 5 if is_aggressive else 3  # OBLITERATUS: 5+ for full removal
+    multi_passes = 7
     
     multi_pass_result = multi_pass_ablate(
         model,
@@ -854,6 +787,7 @@ def _save_metadata(
         "ouroboros_risk": report.ouroboros_risk,
         "peak_layer": report.peak_layer,
         "optimization": {
+            "norm_cap": getattr(opt_result.params, "norm_cap", 1.30),
             "method": getattr(opt_result.params, "method", "projection"),
             "layer_strategy": getattr(opt_result.params, "layer_strategy", "centered"),
             "direction_index": opt_result.params.direction_index,

@@ -14,7 +14,7 @@ import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from .analyze import AnalysisReport
-from .extract import DirectionManifold, project_weights
+from .extract import DirectionManifold, project_weights, re_extract_residual_direction
 from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
 from .ui import info, trial_log, success, metric
 from .lora_ablation import (
@@ -38,7 +38,6 @@ class SearchParams:
     multi_pass: int = 5  # Multi-pass compensation iterations
     target_all: bool = False  # Target all model components for ablation
     layer_tuning: bool = False  # Enable per-layer optimization tuning
-    aggressive: bool = False  # Enable aggressive projection (2.0-3.0x weights)
     # v0.2.0 additions
     probe_alpha: float = 0.0  # How much to weigh probe direction over ablation (0-1)
     safe_alpha: float = 0.0  # How much to weigh safe orthogonal direction (0-1)
@@ -47,6 +46,7 @@ class SearchParams:
     )
     # v0.4.0 additions
     layer_strategy: str = "centered"  # Layer targeting strategy
+    norm_cap: float = 1.30  # Norm preservation cap
 
 
 @dataclass
@@ -64,7 +64,6 @@ def _kernel_weights(
     peak_pos: float,
     max_weight: float,
     min_weight: float,
-    aggressive: bool = False,  # Add aggressive mode for 1.5-2.0x weights
 ) -> list[float]:
     """Bell-curve weight kernel over layers (Heretic-style)."""
     peak_layer = peak_pos * (n_layers - 1)
@@ -74,11 +73,6 @@ def _kernel_weights(
         w = min_weight + (max_weight - min_weight) * math.exp(
             -0.5 * ((i - peak_layer) / sigma) ** 2
         )
-
-        # If aggressive mode, increase weight range to 1.5-2.0x
-        if aggressive:
-            w *= 1.5
-
         weights.append(w)
     return weights
 
@@ -100,7 +94,6 @@ def _layer_weights_for_strategy(
     peak_pos: float,
     max_weight: float,
     min_weight: float,
-    aggressive: bool,
     layer_strategy: str,
 ) -> list[float]:
     if layer_strategy == "knee_cosmic":
@@ -111,27 +104,27 @@ def _layer_weights_for_strategy(
         return get_layer_weights_selective(
             n_layers,
             target_depth=(0.4, 0.6),
-            active_weight=max_weight * (1.5 if aggressive else 1.0),
+            active_weight=max_weight,
             inactive_weight=min_weight,
         )
     if layer_strategy == "selective_60_80":
         return get_layer_weights_selective(
             n_layers,
             target_depth=(0.6, 0.8),
-            active_weight=max_weight * (1.5 if aggressive else 1.0),
+            active_weight=max_weight,
             inactive_weight=min_weight,
         )
     if layer_strategy == "selective_20_40":
         return get_layer_weights_selective(
             n_layers,
             target_depth=(0.2, 0.4),
-            active_weight=max_weight * (1.5 if aggressive else 1.0),
+            active_weight=max_weight,
             inactive_weight=min_weight,
         )
     return get_layer_weights_bell_curve(
         n_layers,
         peak_position=peak_pos,
-        max_weight=max_weight * (1.5 if aggressive else 1.0),
+        max_weight=max_weight,
         min_weight=min_weight,
     )
 
@@ -142,6 +135,7 @@ def _apply_ablation(
     params: SearchParams,
     device: str,
     report: AnalysisReport | None = None,
+    direction_override: torch.Tensor | None = None,
 ):
     """Apply per-layer orthogonal projection in-place.
 
@@ -162,9 +156,12 @@ def _apply_ablation(
         elif safe_alpha > 0:
             direction_type = "safe"
 
-    direction = manifold.sample(
-        params.direction_index, direction_type=direction_type, alpha=direction_alpha
-    ).to(device)
+    if direction_override is not None:
+        direction = direction_override.to(device)
+    else:
+        direction = manifold.sample(
+            params.direction_index, direction_type=direction_type, alpha=direction_alpha
+        ).to(device)
     n_model_layers = len(list(model.model.layers))
     combined_max = max(params.attn_max_weight, params.mlp_max_weight)
 
@@ -173,7 +170,7 @@ def _apply_ablation(
         if report is not None:
             from .extract import compute_knee_cosmic_weights
             knee_weights = compute_knee_cosmic_weights(
-                report, n_model_layers, params.aggressive
+                report, n_model_layers, aggressive=False
             )
             # Re-use combined_max for scaling knee_cosmic weights
             max_sw = max(knee_weights) if knee_weights else 1.0
@@ -186,7 +183,6 @@ def _apply_ablation(
                 params.kernel_peak_pos,
                 combined_max,
                 params.kernel_min_weight,
-                params.aggressive,
                 "centered",
             )
     else:
@@ -195,7 +191,6 @@ def _apply_ablation(
             params.kernel_peak_pos,
             combined_max,
             params.kernel_min_weight,
-            params.aggressive,
             params.layer_strategy,
         )
 
@@ -212,7 +207,6 @@ def _apply_ablation(
         params.kernel_peak_pos,
         params.attn_max_weight,
         params.kernel_min_weight,
-        params.aggressive,
         params.layer_strategy,
     )
     mlp_weights = _layer_weights_for_strategy(
@@ -220,7 +214,6 @@ def _apply_ablation(
         params.kernel_peak_pos,
         params.mlp_max_weight,
         params.kernel_min_weight,
-        False,
         params.layer_strategy,
     )
 
@@ -229,23 +222,50 @@ def _apply_ablation(
         attn_weights = layer_weights
         mlp_weights = layer_weights
 
+    norm_cap = getattr(params, "norm_cap", 1.20)
+
     for i, layer in enumerate(model.model.layers):
+        # Project attention output projection
         if attn_weights[i] > 1e-4:
             try:
                 w = layer.self_attn.o_proj.weight.data
                 layer.self_attn.o_proj.weight.data = project_weights(
-                    w, direction, attn_weights[i]
+                    w, direction, attn_weights[i], norm_cap=norm_cap
                 )
             except AttributeError:
                 pass
+
+            # Also target Q/K/V projections (attention)
+            for proj_name in ["q_proj", "k_proj", "v_proj"]:
+                if hasattr(layer.self_attn, proj_name):
+                    try:
+                        w = getattr(layer.self_attn, proj_name).weight.data
+                        getattr(layer.self_attn, proj_name).weight.data = project_weights(
+                            w, direction, attn_weights[i] * 0.5, norm_cap=norm_cap
+                        )
+                    except (AttributeError, RuntimeError):
+                        pass
+
+        # Project MLP output projection
         if mlp_weights[i] > 1e-4:
             try:
                 w = layer.mlp.down_proj.weight.data
                 layer.mlp.down_proj.weight.data = project_weights(
-                    w, direction, mlp_weights[i]
+                    w, direction, mlp_weights[i], norm_cap=norm_cap
                 )
             except AttributeError:
                 pass
+
+            # Also target gate/up projections (MLP)
+            for proj_name in ["gate_proj", "up_proj"]:
+                if hasattr(layer.mlp, proj_name):
+                    try:
+                        w = getattr(layer.mlp, proj_name).weight.data
+                        getattr(layer.mlp, proj_name).weight.data = project_weights(
+                            w, direction, mlp_weights[i] * 0.5, norm_cap=norm_cap
+                        )
+                    except (AttributeError, RuntimeError):
+                        pass
 
 
 @torch.no_grad()
@@ -400,7 +420,6 @@ def optimize(
     n_trials: int = 200,
     lambda_kl: float = 1.0,
     mu_ouroboros: float = 0.5,
-    aggressive: bool = False,
     max_trials: int = 500,
     multi_pass: int = 5,
     target_all: bool = False,
@@ -423,9 +442,7 @@ def optimize(
     metric("Method", resolved_method)
     metric("lambda_kl", f"{effective_lambda:.2f} (alignment: {report.alignment_type})")
 
-    n_passes = min(
-        3, 1 + int(report.ouroboros_risk > 0.3) + int(report.ouroboros_risk > 0.6)
-    )
+    n_passes = max(3, 1 + int(report.ouroboros_risk > 0.3) + int(report.ouroboros_risk > 0.6))
     metric("Ouroboros passes", str(n_passes))
 
     prior_weights = manifold.prior_distribution()
@@ -487,17 +504,16 @@ def optimize(
         direction_index = float(base_idx) + perturbation
         direction_index = max(0.0, min(direction_index, manifold.n_layers - 1.001))
 
-        # Weight search based on Heretic/OBLITERATUS research: 0.8-1.5 is safe range
-        # Too high (>2.0) breaks model output entirely
+        # Weight search: wider range works across different alignment strengths
         attn_max = trial.suggest_float(
             "attn_max_weight",
-            0.8,   # Heretic default: 0.8-1.5
-            1.5,   # Above 2.0 breaks model
+            0.8,
+            3.0,
         )
         mlp_max = trial.suggest_float(
             "mlp_max_weight",
             0.8,
-            1.5,
+            3.0,
         )
 
         # EXPANDED: More layer strategies for better targeting
@@ -550,7 +566,7 @@ def optimize(
             multi_pass=multi_pass,
             target_all=target_all,
             layer_tuning=layer_tuning,
-            aggressive=aggressive,
+            norm_cap=1.30,
             probe_alpha=probe_alpha,
             safe_alpha=safe_alpha,
             direction_type=direction_type,
@@ -562,8 +578,18 @@ def optimize(
         n_prompts_fast = 20  # Increased from 10 for better accuracy
         with torch.no_grad():
             trial_model = copy.deepcopy(model)
-            for _ in range(n_passes):
-                _apply_ablation(trial_model, manifold, params, device, report=report)
+            # First pass: apply primary direction
+            _apply_ablation(trial_model, manifold, params, device, report=report)
+            # Subsequent passes: re-extract residual direction for iterative refinement
+            for pass_idx in range(1, n_passes):
+                residual = re_extract_residual_direction(
+                    trial_model, tokenizer, device, n_prompts=10
+                )
+                if residual is not None:
+                    _apply_ablation(trial_model, manifold, params, device,
+                                    report=report, direction_override=residual)
+                else:
+                    _apply_ablation(trial_model, manifold, params, device, report=report)
 
             refusal = _measure_refusal_rate(
                 trial_model, tokenizer, device, n_prompts=n_prompts_fast
@@ -609,10 +635,9 @@ def optimize(
             best_metrics["ouroboros_score"] = ouroboros_approx
             success("NEW BEST!")
 
-            # EARLY STOPPING: If refusal < 15%, stop optimization
-            # Going lower breaks model quality - 15% is acceptable tradeoff
-            if refusal < 0.15:
-                success("EARLY STOP: Refusal below 15% - good balance achieved!")
+            # EARLY STOPPING: stop when refusal drops to 2% or below
+            if refusal < 0.02:
+                success("EARLY STOP: Refusal below 2% - target achieved!")
                 study.stop()
         else:
             trial_log(f"Current best: {best_value:.4f}")
@@ -657,7 +682,7 @@ def optimize(
         multi_pass=multi_pass,
         target_all=target_all,
         layer_tuning=layer_tuning,
-        aggressive=aggressive,
+        norm_cap=1.20,
         probe_alpha=probe_alpha,
         safe_alpha=safe_alpha,
         direction_type=direction_type,

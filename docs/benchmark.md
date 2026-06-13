@@ -54,7 +54,6 @@ python run_test.py
 ## Expected results
 
 On Qwen2.5-0.5B-Instruct (default settings):
-| Mode | Harmful Refusal | Harmless Refusal | KL | Balanced |
-|------|-----------------|------------------|----|----------|
-| Standard (3-pass) | <0.15 | <0.05 | <0.3 | >0.85 |
-| Aggressive (5-pass) | <0.05 | <0.05 | <0.5 | >0.90 |
+| Harmful Refusal | Harmless Refusal | KL | Balanced |
+|-----------------|------------------|----|----------|
+| &lt;0.02 | &lt;0.05 | &lt;0.5 | &gt;0.95 |

@@ -33,12 +33,11 @@ def run(
     output_path: Optional[str] = None,
     n_trials: int = 200,
     method: str = "auto",
-    lambda_kl: float = 1.0,  # Quality-KL balance: 1.0 is sweet spot, higher = more quality preservation
-    mu_ouroboros: float = 0.0,  # Disabled - compensation is counterproductive
+    lambda_kl: float = 1.0,
+    mu_ouroboros: float = 0.0,
     device: str = "auto",
     dtype: torch.dtype = torch.float16,
     quantization: Optional[str] = None,
-    aggressive: bool = False,
     max_trials: int = 500,
     multi_pass: int = 5,
     target_all: bool = False,
@@ -128,7 +127,6 @@ def run(
         n_trials=n_trials,
         lambda_kl=lambda_kl,
         mu_ouroboros=mu_ouroboros,
-        aggressive=aggressive,
         max_trials=max_trials,
         multi_pass=multi_pass,
         target_all=target_all,

@@ -17,6 +17,7 @@ def simple_lora_ablate(
     layer_weights: list[float],
     target_layers: Optional[list[int]] = None,
     device: str = "cuda",
+    norm_cap: float = 1.30,
 ) -> dict:
     """Apply simplified LoRA-style ablation.
 
@@ -100,11 +101,11 @@ def simple_lora_ablate(
             proj = (w_normalized @ v).unsqueeze(-1) * v.unsqueeze(0)
             w_new_denorm = w_normalized - weight * proj
             
-            # Restore original norms with 1.10x cap (OBLITERATUS norm preservation)
+            # Restore original norms with norm_cap cap (OBLITERATUS norm preservation)
             # Prevents artifact amplification by limiting norm restoration
             w_new = w_new_denorm * row_norms
             current_norms = w_new.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            cap_ratio = (row_norms / current_norms).clamp(max=1.10)
+            cap_ratio = (row_norms / current_norms).clamp(max=norm_cap)
             w_new = w_new * cap_ratio
 
             module.weight.data = w_new.to(w.dtype)
@@ -123,6 +124,7 @@ def apply_projection_ablation(
     layer_weights: list[float],
     target_layers: Optional[list[int]] = None,
     device: str = "cuda",
+    norm_cap: float = 1.30,
 ) -> dict:
     """Apply standard projection ablation (original method).
 
@@ -134,11 +136,12 @@ def apply_projection_ablation(
         layer_weights: Weight per layer
         target_layers: Layers to modify
         device: Device
+        norm_cap: Norm preservation cap (default 1.10x)
 
     Returns:
         Dict with modification info
     """
-    return simple_lora_ablate(model, direction, layer_weights, target_layers, device)
+    return simple_lora_ablate(model, direction, layer_weights, target_layers, device, norm_cap=norm_cap)
 
 
 def optimal_transport_ablate(

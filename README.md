@@ -41,7 +41,7 @@ With optional dependencies:
 blasphemous ./Qwen2.5-0.5B-Instruct --output ./runs/liberated_qwen --trials 100 --method auto
 ```
 
-Add `--aggressive` for 5-pass full refusal removal.
+The tool uses multi-pass ablation (5 passes) with comprehensive component targeting across all attention and MLP projections by default.
 
 ## Methods
 
@@ -67,9 +67,7 @@ Each pass:
 | 2 | Secondary (orthogonal) | 0.9-1.2x | All components |
 | 3+ | Re-extracted residual | 1.0-2.0x | All components |
 
-**Standard mode** (3 passes): Achieves <10% refusal rates with KL divergence below 0.5.
-
-**Aggressive mode** (5 passes): Full refusal removal for models with strong alignment.
+**5-pass multi-pass ablation**: Achieves <5% refusal rates with KL divergence below 0.5.
 
 ## Projection Targeting
 

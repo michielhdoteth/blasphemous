@@ -17,7 +17,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -45,9 +45,9 @@ all = ["blasphemous[quantization,research]"]
 blasphemous = "blasphemous.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/michi/blasphemous"
-Repository = "https://github.com/michi/blasphemous"
-Issues = "https://github.com/michi/blasphemous/issues"
+Homepage = "https://github.com/michielhdoteth/blasphemous"
+Repository = "https://github.com/michielhdoteth/blasphemous"
+Issues = "https://github.com/michielhdoteth/blasphemous/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["blasphemous"]

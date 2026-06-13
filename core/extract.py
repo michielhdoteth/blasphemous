@@ -423,6 +423,7 @@ def project_weights(
     direction: torch.Tensor,
     strength: float = 1.0,
     preserve_norm: bool = True,
+    norm_cap: float = 1.30,
 ) -> torch.Tensor:
     """Orthogonalize weight matrix w.r.t. a refusal direction.
 
@@ -451,7 +452,7 @@ def project_weights(
             current_norm = weight.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             ratio = original_norm / current_norm
             # OBLITERATUS: cap norm restoration at 1.10x to prevent artifact amplification
-            ratio = ratio.clamp(max=1.10)
+            ratio = ratio.clamp(max=norm_cap)
             weight = weight * ratio
     elif weight.dim() == 1:
         # Weight vector (e.g., bias): [dim]
@@ -463,8 +464,8 @@ def project_weights(
         if preserve_norm and original_norm is not None:
             current_norm = weight.norm().clamp(min=1e-8)
             ratio = original_norm / current_norm
-            # OBLITERATUS: cap norm restoration at 1.10x to prevent artifact amplification
-            ratio = ratio.clamp(max=1.10)
+            # OBLITERATUS: cap norm restoration at norm_cap to prevent artifact amplification
+            ratio = ratio.clamp(max=norm_cap)
             weight = weight * ratio
     else:
         # For higher dimensional tensors, flatten the trailing dimensions
@@ -485,8 +486,8 @@ def project_weights(
                 dim=tuple(range(1, weight.dim())), keepdim=True
             ).clamp(min=1e-8)
             ratio = original_norm / current_norm
-            # OBLITERATUS: cap norm restoration at 1.10x to prevent artifact amplification
-            ratio = ratio.clamp(max=1.10)
+            # OBLITERATUS: cap norm restoration at norm_cap to prevent artifact amplification
+            ratio = ratio.clamp(max=norm_cap)
             weight = weight * ratio
 
     return weight
@@ -593,3 +594,87 @@ def compute_knee_cosmic_weights(report: AnalysisReport, n_layers: int, aggressiv
             weights[layer_idx] = 0.1
 
     return weights
+
+
+def re_extract_residual_direction(
+    model,
+    tokenizer,
+    device: str,
+    n_prompts: int = 15,
+    target_layer: int | None = None,
+) -> torch.Tensor:
+    """Re-extract the residual refusal direction from an ablated model.
+
+    After initial ablation, run the model on harmful vs harmless prompts,
+    compute the REMAINING direction difference in activation space.
+    This catches refusal that survived the first pass.
+
+    For polyhedral cones, extracts from multiple layers and averages.
+
+    Args:
+        model: The (partially ablated) model
+        tokenizer: Tokenizer
+        device: cuda/cpu
+        n_prompts: Number of prompts to use for re-extraction
+        target_layer: Specific layer to extract from. If None, averages across
+                      layers with strongest signal (last third of model).
+
+    Returns:
+        Normalized residual refusal direction vector, or None if none found
+    """
+    from .train_prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
+
+    model.eval()
+    n_layers = len(list(model.model.layers))
+
+    # Determine target layers: either specific layer or range of deep layers
+    if target_layer is not None:
+        target_layers = [target_layer]
+    else:
+        # Use last third of layers for residual extraction
+        start = n_layers * 2 // 3
+        target_layers = list(range(start, n_layers))
+
+    directions = []
+    for tl in target_layers:
+        harmful_residuals = []
+        harmless_residuals = []
+
+        with torch.no_grad():
+            for prompt in HARMFUL_PROMPTS[:n_prompts]:
+                inputs = tokenizer(
+                    prompt, return_tensors="pt", truncation=True, max_length=256
+                ).to(device)
+                outputs = model(**inputs, output_hidden_states=True)
+                if tl < len(outputs.hidden_states):
+                    vec = outputs.hidden_states[tl][0, -1].float().cpu()
+                    harmful_residuals.append(vec)
+
+            for prompt in HARMLESS_PROMPTS[:n_prompts]:
+                inputs = tokenizer(
+                    prompt, return_tensors="pt", truncation=True, max_length=256
+                ).to(device)
+                outputs = model(**inputs, output_hidden_states=True)
+                if tl < len(outputs.hidden_states):
+                    vec = outputs.hidden_states[tl][0, -1].float().cpu()
+                    harmless_residuals.append(vec)
+
+        if not harmful_residuals or not harmless_residuals:
+            continue
+
+        h_winsorized = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmful_residuals]
+        n_winsorized = [winsorize_activations(v.unsqueeze(0)).squeeze(0) for v in harmless_residuals]
+        h = torch.stack(h_winsorized).to(device)
+        n = torch.stack(n_winsorized).to(device)
+
+        diff = h.mean(0) - n.mean(0)
+        norm = diff.norm()
+        if norm > 1e-6:
+            directions.append(diff / norm)
+
+    if not directions:
+        return None
+
+    # Average directions across layers
+    avg = torch.stack(directions).mean(0)
+    return avg / (avg.norm() + 1e-8)

@@ -54,18 +54,12 @@ Examples:
     parser.add_argument(
         "--quantization", default=None, choices=["bnb_4bit"], help="Quantization mode"
     )
-parser.add_argument(
+    parser.add_argument(
         "--method",
         "-m",
         default="auto",
         choices=["projection", "lora", "optimal_transport", "auto"],
         help="Core method: auto (uses analysis to choose), projection, lora, or optimal_transport.",
-    )
-    parser.add_argument(
-        "--aggressive",
-        "-a",
-        action="store_true",
-        help="Aggressive mode: max ablation weight, accept quality loss",
     )
     parser.add_argument(
         "--strategy",
@@ -116,13 +110,6 @@ parser.add_argument(
         type=float,
         default=0.1,
         help="Intervention strength for token mode (default: 0.1)",
-    )
-    # Aggressive projection weights
-    parser.add_argument(
-        "--aggressive-weights",
-        action="store_true",
-        default=False,
-        help="Enable aggressive projection (1.5-2.0x weights)",
     )
     # More optimization trials
     parser.add_argument(
@@ -223,7 +210,6 @@ def _run_full(args, dtype_map):
         device=args.device,
         dtype=dtype_map[args.dtype],
         quantization=args.quantization,
-        aggressive=args.aggressive_weights,
         max_trials=args.max_trials,
         multi_pass=args.multi_pass,
         target_all=args.target_all,

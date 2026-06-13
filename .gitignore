@@ -121,3 +121,6 @@ config.local.toml
 # Separate projects
 landing-page/
 .squish/
+
+# Source junction (blasphemous -> core for package discovery)
+blasphemous/

@@ -14,9 +14,9 @@ Basic ablation:
 blasphemous ./Qwen2.5-0.5B-Instruct --output ./runs/liberated_qwen_release --trials 100 --method auto
 ```
 
-Aggressive mode (full refusal removal, 5-pass multi-pass):
+Full ablation (5-pass multi-pass):
 ```bash
-blasphemous ./Qwen2.5-0.5B-Instruct --output ./runs/liberated_qwen_release --trials 200 --method auto --aggressive
+blasphemous ./Qwen2.5-0.5B-Instruct --output ./runs/liberated_qwen_release --trials 200 --method auto
 ```
 
 Analyze-only (no ablation, just geometry analysis):
@@ -35,7 +35,6 @@ result = run(
     output_path="./runs/liberated_qwen_release",
     n_trials=100,
     method="auto",
-    aggressive=True,        # 5-pass multi-pass ablation
     lambda_kl=1.0,          # Quality-KL balance
 )
 ```
@@ -53,7 +52,7 @@ metrics = measure_erasure(model, direction, layer_ids)
 ## Expected results
 
 With default settings on Qwen2.5-0.5B-Instruct:
-- Harmful refusal rate: <15% (standard), <5% (aggressive)
+- Harmful refusal rate: <2%
 - Harmless refusal rate: <5%
 - KL divergence: <0.5
 - Balanced score: >0.85
